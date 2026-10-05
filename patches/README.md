@@ -655,9 +655,13 @@ uncatchable V8 RangeError.
   `GECKO_WJ_HELPCOST` overrides; `GECKO_WJ_HELPCROSDBG` logs
   `[wj-xrefuse]` refusals). Callers: `wjhelp` (all helper kinds) and
   `WasmJitRunCall` (the JS->WJ dispatch edge).
-- Refusal reports `ReportOverRecursed` (catchable InternalError) when a
-  context exists and returns the "threw" status; scope guards restore
-  `gWJJitDepth` and `jsExitFP` on every path so state stays consistent.
+- Over-budget latches `gWJSuspendWatermark` so further JS->WJ edges
+  delegate to PBL instead of re-charging; `WasmJitRunCall` returns 0
+  (caller falls through to MaybeEnterJit/PBL -- the subtree runs on the
+  heap shadow stack) while `wjhelp` reports `ReportOverRecursed` and
+  returns the 1.0 threw-contract (a helper cannot delegate mid-frame).
+- Scope guards restore `gWJJitDepth` and `jsExitFP` on every path so
+  state stays consistent.
 
 Verified (embed, warmed WJ path): a deep method-call chain trips
 `[wj-xrefuse]` at the limit and throws catchable `InternalError: too much
