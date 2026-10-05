@@ -620,3 +620,23 @@ content JS gets only ~452KB of the 64MB linear-memory stack -- measured
 Expected effect: untrusted recursion budget ~452KB -> ~31MB (~60x), i.e.
 ~620k host-boundary levels. Still catchable: quota < real stack, so
 over-quota throws `InternalError` before a real wasm stack overflow.
+
+## 0011-interp-nest-depth-guard.patch
+
+With the 0010 quota raise, x.com's delegated recursion escaped SpiderMonkey's
+catchable bound and instead overflowed V8's REAL stack (the host-side wasm
+call stack): `Uncaught RangeError: Maximum call stack size exceeded` kills the
+app pthread -- strictly worse than the 452KB-quota InternalError. Measured:
+nested `RunScript` activations are the actual host-stack consumer (each host
+boundary = one more live wasm call chain); a map-callback chain survives
+>120k entries, so V8's bound is far above the ~9.5k the old quota allowed.
+Nothing bounded the nesting itself.
+
+- `RunScript` entry now counts live interpreter activations
+  (`gNestDepth`, RAII-decremented). Covers Interpret + PBL + WJ-delegated
+  entries uniformly -- each is one wasm-call-chain segment.
+- `GECKO_NESTDBG` prints `[nest] depth=N` every 2048 crossings to measure a
+  site's true crash depth.
+- `GECKO_NESTMAX=<n>` (default 0 = off for now) throws a catchable
+  InternalError at the cap. Once a site's real V8 bound is known, a nonzero
+  default can keep over-recursion catchable instead of pthread-fatal.
