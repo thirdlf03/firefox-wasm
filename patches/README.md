@@ -640,3 +640,56 @@ Nothing bounded the nesting itself.
 - `GECKO_NESTMAX=<n>` (default 0 = off for now) throws a catchable
   InternalError at the cap. Once a site's real V8 bound is known, a nonzero
   default can keep over-recursion catchable instead of pthread-fatal.
+
+## 0012-wasmjit-host-boundary-charge.patch
+
+x.com's root-landing crash turned out to be a second recursion class the WJ
+prologue byte-guard never sees: `WJ fn -> wjhelp -> host wasm -> WJ fn`
+crossing cycles that re-enter compiled code WITHOUT passing a WJ prologue
+(`[wj-sus]` never fires, `GECKO_WJ_DEPTHLIMIT` has no effect). The host
+stack is still consumed per crossing, so the chain dies with the same
+uncatchable V8 RangeError.
+
+- `WJChargeHostBoundary(kind)` charges each crossing to the existing
+  `gWJJitDepth` byte account (default 6000/crossing,
+  `GECKO_WJ_HELPCOST` overrides; `GECKO_WJ_HELPCROSDBG` logs
+  `[wj-xrefuse]` refusals). Callers: `wjhelp` (all helper kinds) and
+  `WasmJitRunCall` (the JS->WJ dispatch edge).
+- Refusal reports `ReportOverRecursed` (catchable InternalError) when a
+  context exists and returns the "threw" status; scope guards restore
+  `gWJJitDepth` and `jsExitFP` on every path so state stays consistent.
+
+Verified (embed, warmed WJ path): a deep method-call chain trips
+`[wj-xrefuse]` at the limit and throws catchable `InternalError: too much
+recursion` with the engine alive -- previously an uncatchable pthread-killing
+RangeError.
+
+## 0013-emscripten-host-charge.patch
+
+The remaining unguarded shapes are recursive paths that never re-enter a WJ
+prologue: scripted getter/setter chains, method-call chains, and pure C++
+recursion (JSON stringify/parse, ToSource, parser). All overflow the real
+host stack the same way. The fix shares ONE account with the WJ byte-guard
+because WJ frames and C++ frames interleave on the same host stack.
+
+- `AutoCheckRecursionLimit` gains an optional `hostCharge` ctor arg
+  (default 0 = unchanged). Under `__EMSCRIPTEN__` the ctor adds the charge
+  to `gWJJitDepth` and the dtor refunds it (strict LIFO, same discipline as
+  the WJ prologue save/restore), and `checkLimitImpl` fails when the
+  account exceeds `gWJJitDepthLimit`. Mirrors the `__wasi__` depth-count
+  precedent already in the class.
+- `RunScript` additionally charges every live interpreter activation
+  (default 4000, `GECKO_HOSTCOST` overrides). This is the single choke
+  point that covers PBL-dispatched getter/setter chains and nested
+  native->script calls, which do not pass `js::CallGetter` or a WJ
+  prologue.
+- Site weights (measured per-level real costs): `SerializeJSONProperty`
+  2400 (~2.4KB/level measured), `js::CallGetter`/`CallSetter` 1500 on top
+  of the RunScript charge.
+
+Measured (embed, defaults, no env): deep getter / method-call / JSON /
+plain / map-callback chains all now throw catchable `InternalError: too
+much recursion` with the engine alive -- previously all hard-crashed the
+pthread. The bound is conservative by design (defensive floor); raise
+`GECKO_WJ_DEPTHLIMIT` or lower `GECKO_HOSTCOST` if a real site needs
+deeper legit nesting.

@@ -1,0 +1,189 @@
+--- a/js/public/friend/StackLimits.h
++++ b/js/public/friend/StackLimits.h
+@@ -42,6 +42,15 @@
+ extern MOZ_COLD JS_PUBLIC_API bool CheckWasiRecursionLimit(FrontendContext* fc);
+ #endif  // __wasi__
+ 
++#ifdef __EMSCRIPTEN__
++// Estimated host (V8/native) stack charge, in bytes, tracked per live scope.
++// Shares the WJ depth account so JIT frames and C++ recursion sum into one
++// budget; the budget itself is gWJJitDepthLimit (host-calibrated).
++extern MOZ_COLD JS_PUBLIC_API void IncEmscriptenHostCharge(int32_t charge);
++extern MOZ_COLD JS_PUBLIC_API void DecEmscriptenHostCharge(int32_t charge);
++extern MOZ_COLD JS_PUBLIC_API bool EmscriptenHostChargeExceeded();
++#endif  // __EMSCRIPTEN__
++
+ // The minimum margin for stack limit to ensure that the periodic
+ // AutoCheckRecursionLimit operation is sufficient.
+ //
+@@ -86,8 +95,13 @@
+   mozilla::Variant<JSContext*, FrontendContext*> context_;
+ #endif  // __wasi__
+ 
++#ifdef __EMSCRIPTEN__
++  int32_t hostCharged_ = 0;
++#endif  // __EMSCRIPTEN__
++
+  public:
+-  explicit MOZ_ALWAYS_INLINE AutoCheckRecursionLimit(JSContext* cx)
++  explicit MOZ_ALWAYS_INLINE AutoCheckRecursionLimit(
++      JSContext* cx, int32_t hostCharge = 0)
+ #ifdef __wasi__
+       : context_(mozilla::AsVariant(cx))
+ #endif  // __wasi__
+@@ -95,9 +109,16 @@
+ #ifdef __wasi__
+     incWasiRecursionDepth();
+ #endif  // __wasi__
++#ifdef __EMSCRIPTEN__
++    hostCharged_ = hostCharge;
++    if (MOZ_UNLIKELY(hostCharged_ != 0)) {
++      IncEmscriptenHostCharge(hostCharged_);
++    }
++#endif  // __EMSCRIPTEN__
+   }
+ 
+-  explicit MOZ_ALWAYS_INLINE AutoCheckRecursionLimit(FrontendContext* fc)
++  explicit MOZ_ALWAYS_INLINE AutoCheckRecursionLimit(
++      FrontendContext* fc, int32_t hostCharge = 0)
+ #ifdef __wasi__
+       : context_(mozilla::AsVariant(fc))
+ #endif  // __wasi__
+@@ -105,12 +126,23 @@
+ #ifdef __wasi__
+     incWasiRecursionDepth();
+ #endif  // __wasi__
++#ifdef __EMSCRIPTEN__
++    hostCharged_ = hostCharge;
++    if (MOZ_UNLIKELY(hostCharged_ != 0)) {
++      IncEmscriptenHostCharge(hostCharged_);
++    }
++#endif  // __EMSCRIPTEN__
+   }
+ 
+   MOZ_ALWAYS_INLINE ~AutoCheckRecursionLimit() {
+ #ifdef __wasi__
+     decWasiRecursionDepth();
+ #endif  // __wasi__
++#ifdef __EMSCRIPTEN__
++    if (MOZ_UNLIKELY(hostCharged_ != 0)) {
++      DecEmscriptenHostCharge(hostCharged_);
++    }
++#endif  // __EMSCRIPTEN__
+   }
+ 
+ #ifdef __wasi__
+@@ -186,6 +218,12 @@
+     JS::NativeStackLimit limit, void* sp) const {
+   JS_STACK_OOM_POSSIBLY_FAIL();
+ 
++#ifdef __EMSCRIPTEN__
++  if (MOZ_UNLIKELY(EmscriptenHostChargeExceeded())) {
++    return false;
++  }
++#endif  // __EMSCRIPTEN__
++
+ #ifdef __wasi__
+   if (!checkWasiRecursionLimit()) {
+     return false;
+--- a/js/src/jsfriendapi.cpp
++++ b/js/src/jsfriendapi.cpp
+@@ -367,6 +367,25 @@
+   return fc->stackLimit();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace js::wasm {
++extern int32_t gWJJitDepth;
++extern int32_t gWJJitDepthLimit;
++}  // namespace js::wasm
++
++JS_PUBLIC_API void js::IncEmscriptenHostCharge(int32_t charge) {
++  js::wasm::gWJJitDepth += charge;
++}
++
++JS_PUBLIC_API void js::DecEmscriptenHostCharge(int32_t charge) {
++  js::wasm::gWJJitDepth -= charge;
++}
++
++JS_PUBLIC_API bool js::EmscriptenHostChargeExceeded() {
++  return js::wasm::gWJJitDepth > js::wasm::gWJJitDepthLimit;
++}
++#endif  // __EMSCRIPTEN__
++
+ JS_PUBLIC_API JSFunction* js::DefineFunctionWithReserved(
+     JSContext* cx, JSObject* objArg, const char* name, JSNative call,
+     unsigned nargs, unsigned attrs) {
+--- a/js/src/builtin/JSON.cpp
++++ b/js/src/builtin/JSON.cpp
+@@ -755,7 +755,7 @@
+     return false;
+   }
+ 
+-  AutoCheckRecursionLimit recursion(cx);
++  AutoCheckRecursionLimit recursion(cx, 2400);
+   if (!recursion.check(cx)) {
+     return false;
+   }
+--- a/js/src/vm/Interpreter.cpp
++++ b/js/src/vm/Interpreter.cpp
+@@ -417,6 +417,8 @@
+ // can root it for MCallee (closures sharing a script differ from the canonical
+ // function; see WasmJitBackend.cpp usesCallee).
+ extern uint64_t gWJCallCallee;
++extern int32_t gWJJitDepth;
++extern int32_t gWJJitDepthLimit;
+ }  // namespace wasm
+ }  // namespace js
+ #endif
+@@ -447,6 +449,28 @@
+     fprintf(stderr, "[nest] depth=%u\n", nestDepth);
+   }
+   if (gNestMax && nestDepth > gNestMax) {
++    cx->onOverRecursed();
++    return false;
++  }
++
++  // Estimated host-stack cost of this activation, charged to the shared
++  // WJ byte account so C++/JIT/script frames sum into one budget.
++  static int32_t gHostCost = 0;
++  static bool gHostCostInit = false;
++  if (!gHostCostInit) {
++    gHostCostInit = true;
++    if (const char* e = getenv("GECKO_HOSTCOST"); e && *e) {
++      gHostCost = int32_t(strtol(e, nullptr, 10));
++    } else {
++      gHostCost = 4000;
++    }
++  }
++  int32_t* hostDepth = &js::wasm::gWJJitDepth;
++  const int32_t savedHostDepth = *hostDepth;
++  auto hostGuard = mozilla::MakeScopeExit(
++      [=] { *hostDepth = savedHostDepth; });
++  *hostDepth = savedHostDepth + gHostCost;
++  if (*hostDepth > js::wasm::gWJJitDepthLimit) {
+     cx->onOverRecursed();
+     return false;
+   }
+@@ -930,6 +954,10 @@
+ 
+ bool js::CallGetter(JSContext* cx, HandleValue thisv, HandleValue getter,
+                     MutableHandleValue rval) {
++  AutoCheckRecursionLimit recursion(cx, 1500);
++  if (!recursion.check(cx)) {
++    return false;
++  }
+   FixedInvokeArgs<0> args(cx);
+ 
+   return Call(cx, getter, thisv, args, rval, CallReason::Getter);
+@@ -937,6 +965,10 @@
+ 
+ bool js::CallSetter(JSContext* cx, HandleValue thisv, HandleValue setter,
+                     HandleValue v) {
++  AutoCheckRecursionLimit recursion(cx, 1500);
++  if (!recursion.check(cx)) {
++    return false;
++  }
+   FixedInvokeArgs<1> args(cx);
+   args[0].set(v);
+ 
