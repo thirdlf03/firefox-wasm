@@ -653,20 +653,29 @@ uncatchable V8 RangeError.
 - `WJChargeHostBoundary(kind)` charges each crossing to the existing
   `gWJJitDepth` byte account (default 6000/crossing,
   `GECKO_WJ_HELPCOST` overrides; `GECKO_WJ_HELPCROSDBG` logs
-  `[wj-xrefuse]` refusals). Callers: `wjhelp` (all helper kinds) and
-  `WasmJitRunCall` (the JS->WJ dispatch edge).
+  `[wj-xrefuse]` refusals). Callers: `wjhelp` (all helper kinds EXCEPT
+  `WJH_CALL`) and `WasmJitRunCall` (the JS->WJ dispatch edge).
+- `WJH_CALL` is exempt because it delegates internally: its fast path
+  checks `gWJSuspendWatermark` and falls to `JS::Call`, and a callee
+  prologue flag-3.0 refusal does the same -- charging the helper edge
+  would kill calls that could still run on PBL.
 - Over-budget latches `gWJSuspendWatermark` so further JS->WJ edges
   delegate to PBL instead of re-charging; `WasmJitRunCall` returns 0
   (caller falls through to MaybeEnterJit/PBL -- the subtree runs on the
   heap shadow stack) while `wjhelp` reports `ReportOverRecursed` and
   returns the 1.0 threw-contract (a helper cannot delegate mid-frame).
+- `wj_set_depth_limit` now honors `GECKO_WJ_DEPTHLIMIT`: the emit side
+  bakes the env as a const but the C++ charge paths read
+  `gWJJitDepthLimit`, which the calibration probe overwrote -- apply the
+  env here so all paths share one budget.
 - Scope guards restore `gWJJitDepth` and `jsExitFP` on every path so
   state stays consistent.
 
-Verified (embed, warmed WJ path): a deep method-call chain trips
-`[wj-xrefuse]` at the limit and throws catchable `InternalError: too much
-recursion` with the engine alive -- previously an uncatchable pthread-killing
-RangeError.
+Verified (embed, warmed WJ path): a deep method-call chain now delegates
+and COMPLETES (~1200 levels) instead of throwing, while non-delegable
+shapes still trip `[wj-xrefuse]` -> catchable `InternalError: too much
+recursion` with the engine alive -- previously an uncatchable
+pthread-killing RangeError.
 
 ## 0013-emscripten-host-charge.patch
 
