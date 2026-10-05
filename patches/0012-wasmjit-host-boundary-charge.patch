@@ -1,8 +1,27 @@
+diff --git a/js/src/wasm/WasmJitBackend.h b/js/src/wasm/WasmJitBackend.h
+index 0002ca8df2..0aef59d0d4 100644
+--- a/js/src/wasm/WasmJitBackend.h
++++ b/js/src/wasm/WasmJitBackend.h
+@@ -559,6 +559,14 @@ extern int32_t gWJJitDepthLimit;
+ // latch clears itself once the delegating frame unwinds below the watermark.
+ extern int32_t gWJSuspendWatermark;
+ 
++// Separate account for estimated host (C++/wasm-boundary) stack bytes:
++// RunScript activations, wjhelp crossings and AutoCheckRecursionLimit sites
++// charge here instead of gWJJitDepth, whose calibrated limit was sized for
++// ~800B JIT frames -- sharing it starved the boundary budget once a delegated
++// subtree had accumulated prologue bytes. GECKO_HOSTLIMIT overrides the limit.
++extern int32_t gWJHostDepth;
++extern int32_t gWJHostDepthLimit;
++
+ // Scratch-buffer layout (shared with WasmJitRuntime.cpp's gWJScratch + the host
+ // call marshalling). Sized for nargs<=64 with slack.
+ // Register-argument call ABI. JIT'd "main" functions take wasm params
 diff --git a/js/src/wasm/WasmJitRuntime.cpp b/js/src/wasm/WasmJitRuntime.cpp
-index c22f034d47..8f44d4db82 100644
+index c22f034d47..cafcb28eca 100644
 --- a/js/src/wasm/WasmJitRuntime.cpp
 +++ b/js/src/wasm/WasmJitRuntime.cpp
-@@ -1766,6 +1766,36 @@ static bool WJStormDecision(WJEntry& e, JSScript* script) {
+@@ -1766,6 +1766,41 @@ static bool WJStormDecision(WJEntry& e, JSScript* script) {
    return true;
  }
  
@@ -16,36 +35,41 @@ index c22f034d47..8f44d4db82 100644
 +               ? int32_t(cost)
 +               : int32_t(6000);
 +  }();
-+  int32_t savedDepth = gWJJitDepth;
++  static int32_t hostLimit = [] {
++    const char* env = getenv("GECKO_HOSTLIMIT");
++    return env ? atoi(env) : 0;
++  }();
++  if (hostLimit > 0) gWJHostDepthLimit = hostLimit;
++  int32_t savedDepth = gWJHostDepth;
 +  int64_t chargedDepth = int64_t(savedDepth) + charge;
 +  // Coercions/proxies can re-enter JS; allow PBL helpers while suspended.
-+  if (chargedDepth > gWJJitDepthLimit) {
++  if (chargedDepth > gWJHostDepthLimit) {
 +    static int crossDbg = getenv("GECKO_WJ_HELPCROSDBG") ? 1 : 0;
 +    if (crossDbg) {
 +      fprintf(stderr, "[wj-xrefuse] depth=%d charge=%d lim=%d kind=%d\n",
-+              savedDepth, charge, gWJJitDepthLimit, kind);
++              savedDepth, charge, gWJHostDepthLimit, kind);
 +    }
-+    // Latch suspension: further JS->WJ edges delegate to PBL instead of
-+    // re-charging the already-deep host stack.
-+    if (savedDepth < gWJSuspendWatermark) {
-+      gWJSuspendWatermark = savedDepth;
++    // Latch suspension (in WJ-account units): further JS->WJ edges delegate to
++    // PBL instead of growing the already-deep host stack.
++    if (gWJJitDepth < gWJSuspendWatermark) {
++      gWJSuspendWatermark = gWJJitDepth;
 +    }
 +    return false;
 +  }
-+  gWJJitDepth = int32_t(chargedDepth);
++  gWJHostDepth = int32_t(chargedDepth);
 +  return true;
 +}
 +
  int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
                               const JS::Value* argv, uint32_t argc,
                               JSObject* envChain, uint64_t* retBits) {
-@@ -1866,6 +1896,14 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
+@@ -1866,6 +1901,14 @@ int js::wasm::WasmJitRunCall(JSScript* script, uint64_t thisBits,
      return 0;  // underflow: let the interpreter pad
    }
  
-+  int32_t savedDepth = gWJJitDepth;
++  int32_t savedDepth = gWJHostDepth;
 +  auto depthGuard = mozilla::MakeScopeExit([savedDepth] {
-+    gWJJitDepth = savedDepth;
++    gWJHostDepth = savedDepth;
 +  });
 +  // Over budget: delegate to the interpreter/PBL rather than throwing --
 +  // the subtree keeps running on the heap shadow stack.
@@ -54,18 +78,18 @@ index c22f034d47..8f44d4db82 100644
    // Stage ALL actual args (not just the formal nargs) so the callee's GetFrameArgument
    // can read args beyond its formal count (e.g. self-hosted IteratorReduce reads
    // GetArgument(1)=initialValue while its only formal is `reducer`). Staging only
-@@ -2895,6 +2933,10 @@ static double WJTryNativeFast(JSContext* cx, JSFunction* nfun, JSNative nn,
+@@ -2895,6 +2938,10 @@ static double WJTryNativeFast(JSContext* cx, JSFunction* nfun, JSNative nn,
  }
  
  extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
-+  int32_t savedDepth = gWJJitDepth;
++  int32_t savedDepth = gWJHostDepth;
 +  auto depthGuard = mozilla::MakeScopeExit([savedDepth] {
-+    gWJJitDepth = savedDepth;
++    gWJHostDepth = savedDepth;
 +  });
    gWJLastHelpKind = uint32_t(kindF);
    gWJLastHelpSite = uint32_t(siteF);
    // Save + restore the activation's jsExitFP around EVERY helper: a helper that
-@@ -2912,10 +2954,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
+@@ -2912,10 +2959,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE double wjhelp(double kindF, double siteF) {
        (void*)wjact == gWJEntryAct) {
      wjact->asJit()->setJSExitFP(gWJEntryExitFP);
    }
@@ -92,7 +116,17 @@ index c22f034d47..8f44d4db82 100644
    // Contract check (GECKO_WJ_DEPTHDBG): 1.0 means "threw" -- returning it with
    // NO pending exception surfaces as an undebuggable silent failure.
    static int helpDbg = getenv("GECKO_WJ_DEPTHDBG") ? 1 : 0;
-@@ -7198,7 +7253,18 @@ int32_t gWJSuspendWatermark = INT32_MAX;
+@@ -7194,11 +7254,28 @@ int32_t gWJJitDepthLimit = 480000;
+ // suspended. Written by emitted code on depth overflow (min-update), read by
+ // every JS->WJ entry edge in this file.
+ int32_t gWJSuspendWatermark = INT32_MAX;
++// Host-boundary byte account (see WasmJitBackend.h). Not host-calibrated: the
++// 480000 default bounds each charged site conservatively (RunScript ~120,
++// helper ~80, JSON ~200 levels -- all measured-safe on the ~1MB V8 wasm stack).
++// GECKO_HOSTLIMIT overrides.
++int32_t gWJHostDepth = 0;
++int32_t gWJHostDepthLimit = 480000;
+ }  // namespace wasm
  }  // namespace js
  
  extern "C" EMSCRIPTEN_KEEPALIVE void wj_set_depth_limit(int32_t v) {

@@ -650,11 +650,13 @@ crossing cycles that re-enter compiled code WITHOUT passing a WJ prologue
 stack is still consumed per crossing, so the chain dies with the same
 uncatchable V8 RangeError.
 
-- `WJChargeHostBoundary(kind)` charges each crossing to the existing
-  `gWJJitDepth` byte account (default 6000/crossing,
+- `WJChargeHostBoundary(kind)` charges each crossing to a DEDICATED
+  host-boundary account `gWJHostDepth` (default 6000/crossing,
   `GECKO_WJ_HELPCOST` overrides; `GECKO_WJ_HELPCROSDBG` logs
   `[wj-xrefuse]` refusals). Callers: `wjhelp` (all helper kinds EXCEPT
-  `WJH_CALL`) and `WasmJitRunCall` (the JS->WJ dispatch edge).
+  `WJH_CALL`) and `WasmJitRunCall` (the JS->WJ dispatch edge). The
+  account is separate from `gWJJitDepth` so a delegated PBL subtree
+  (WJ bytes still high, watermark latched) keeps a full C++ budget.
 - `WJH_CALL` is exempt because it delegates internally: its fast path
   checks `gWJSuspendWatermark` and falls to `JS::Call`, and a callee
   prologue flag-3.0 refusal does the same -- charging the helper edge
@@ -667,9 +669,11 @@ uncatchable V8 RangeError.
 - `wj_set_depth_limit` now honors `GECKO_WJ_DEPTHLIMIT`: the emit side
   bakes the env as a const but the C++ charge paths read
   `gWJJitDepthLimit`, which the calibration probe overwrote -- apply the
-  env here so all paths share one budget.
-- Scope guards restore `gWJJitDepth` and `jsExitFP` on every path so
-  state stays consistent.
+  env here so the WJ paths share one budget. `GECKO_HOSTLIMIT`
+  (default 480000) sizes `gWJHostDepthLimit` independently.
+- Scope guards restore `gWJHostDepth` and `jsExitFP` on every path so
+  state stays consistent; the suspend watermark still latches on the
+  WJ account (`gWJJitDepth`).
 
 Verified (embed, warmed WJ path): a deep method-call chain now delegates
 and COMPLETES (~1200 levels) instead of throwing, while non-delegable
@@ -682,15 +686,18 @@ pthread-killing RangeError.
 The remaining unguarded shapes are recursive paths that never re-enter a WJ
 prologue: scripted getter/setter chains, method-call chains, and pure C++
 recursion (JSON stringify/parse, ToSource, parser). All overflow the real
-host stack the same way. The fix shares ONE account with the WJ byte-guard
-because WJ frames and C++ frames interleave on the same host stack.
+host stack the same way. These charge the dedicated host account
+`gWJHostDepth` (NOT `gWJJitDepth`): an earlier shared-account design
+starved delegated PBL subtrees, which kept running C++ frames while the
+WJ byte total stayed pinned near its limit.
 
 - `AutoCheckRecursionLimit` gains an optional `hostCharge` ctor arg
   (default 0 = unchanged). Under `__EMSCRIPTEN__` the ctor adds the charge
-  to `gWJJitDepth` and the dtor refunds it (strict LIFO, same discipline as
-  the WJ prologue save/restore), and `checkLimitImpl` fails when the
-  account exceeds `gWJJitDepthLimit`. Mirrors the `__wasi__` depth-count
-  precedent already in the class.
+  to `gWJHostDepth` and the dtor refunds it (strict LIFO, same discipline
+  as the WJ prologue save/restore), and `checkLimitImpl` fails when the
+  account exceeds `gWJHostDepthLimit` (default 480000, `GECKO_HOSTLIMIT`
+  overrides). Mirrors the `__wasi__` depth-count precedent already in
+  the class.
 - `RunScript` additionally charges every live interpreter activation
   (default 4000, `GECKO_HOSTCOST` overrides). This is the single choke
   point that covers PBL-dispatched getter/setter chains and nested
@@ -700,9 +707,13 @@ because WJ frames and C++ frames interleave on the same host stack.
   2400 (~2.4KB/level measured), `js::CallGetter`/`CallSetter` 1500 on top
   of the RunScript charge.
 
-Measured (embed, defaults, no env): deep getter / method-call / JSON /
-plain / map-callback chains all now throw catchable `InternalError: too
-much recursion` with the engine alive -- previously all hard-crashed the
-pthread. The bound is conservative by design (defensive floor); raise
-`GECKO_WJ_DEPTHLIMIT` or lower `GECKO_HOSTCOST` if a real site needs
-deeper legit nesting.
+Measured (embed, defaults, no env) with the separate host account:
+boundary-consuming chains (deep getter, JSON, sort-callback) throw
+catchable `InternalError: too much recursion` with the engine alive,
+while delegatable chains now COMPLETE -- plain recursion 30000 levels,
+map-callback 4000, method-call 799, direct WJ call 1199 -- because the
+delegated subtree runs PBL-internal frames that consume neither the WJ
+nor the host account (and no real stack). Previously every shape above
+hard-crashed the pthread. The bound is conservative by design
+(defensive floor); raise `GECKO_HOSTLIMIT` or lower `GECKO_HOSTCOST`
+if a real site needs deeper legit boundary nesting.
