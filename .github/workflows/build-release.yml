@@ -48,8 +48,10 @@ name: build-and-release
 # the -r relink. Because that 80 min depends only on firefox/ + mozconfig + toolchain
 # and NOT on the embedder/JS sources we actually iterate on, the pruned objdir is
 # cached (see the engine-cache steps) so a hit skips the engine build: ~90 min per
-# iteration becomes ~15 min. The self-hosted `firefox` runner keeps its own persistent
-# objdir and never touches that cache.
+# iteration becomes ~15 min. Cache misses are cheaper than a cold build anyway:
+# sccache (below) reuses unchanged compiles across runs by content hash. The
+# self-hosted `firefox` runner keeps its own persistent objdir and never touches
+# that cache.
 
 on:
   push:
@@ -135,8 +137,9 @@ jobs:
       # (9.2 GB, which compresses well under the 10 GB/repo Actions cache limit) and
       # skip `make build` entirely on a hit. Keyed on every input that changes the
       # objdir -- including the FIREFOX_REF pin, which lives in the Makefile -- so a
-      # miss is always safe (it just falls back to a full build). NOTES:
-      #   * the `patches1` salt marks that patches/*.patch are APPLIED by the build (see
+      # miss is always safe (it just falls back to a full build; sccache below makes
+      # that miss cheaper than a cold build). NOTES:
+      #   * the `patches2` salt marks that patches/*.patch are APPLIED by the build (see
       #     the Makefile's $(PATCH_STAMP) target). Hashing patches/** alone is not enough:
       #     it cannot distinguish an objdir built WITH the patches from one built without
       #     them, so without the salt this would restore a baseline-JIT objdir and silently
@@ -256,6 +259,20 @@ jobs:
           corepack enable
           corepack prepare "pnpm@${PNPM_VERSION}" --activate
           pnpm --version
+
+      # --- compiler cache -----------------------------------------------------
+      # The objdir cache above only helps on exact hits; ANY patch edit misses
+      # and pays the ~80 min cold build. mozconfig.full.emscripten already wraps
+      # compilers with `sccache` when the binary is on PATH (verified to cache
+      # emcc + host clang locally), so installing it here turns a patches/**
+      # cache miss into a mostly-warm compile: content-hashed inputs mean patch
+      # reverts/removals can never reuse stale objects (unlike mtime games).
+      # Backed by the Actions cache service; hit stats print at job end.
+      - name: Set up sccache (compiler cache for engine builds)
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.18.0
+          stats: true
 
       # em_config is committed and portable (reads $EMSDK; binaryen defaults to the
       # emsdk's bundled $EMSDK/upstream), so no shim or config generation is needed.
