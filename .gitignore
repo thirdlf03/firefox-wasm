@@ -76,3 +76,6 @@ bench/site/build/
 bench/site/node_modules/
 bench/site/package.json
 bench/site/package-lock.json
+
+# engine-patch stamp (see Makefile PATCH_STAMP; must live outside firefox/)
+/.wj-patched

@@ -44,7 +44,7 @@ WISP_PATCH_SRC := gecko.js/patch-emsdk-wasmfs.mjs gecko.js/emsdk-patches/wisp_so
 # -> 0, and 1.59x on the object/class/accessor family). Applied in file-name order.
 PATCH_SRC   := $(abspath $(sort $(wildcard patches/*.patch)))
 PATCH_SRC_R := $(shell printf '%s\n' $(PATCH_SRC) | sort -r | tr '\n' ' ')
-PATCH_STAMP := firefox/.wj-patched
+PATCH_STAMP := .wj-patched
 
 EM_CONFIG           ?= $(ROOT)/em_config
 MOZCONFIG           ?= $(ROOT)/mozconfig.full.emscripten

@@ -14,7 +14,7 @@ git -C firefox apply ../patches/0001-wasmjit-lowering-improvements.patch
 
 **The full engine build applies (and verifies) these automatically** — apply them by hand
 only for the JS-only dev loop, which uses `make firefox` + `mach` directly and never runs
-`make build`. `make build` / `make configure` depend on `firefox/.wj-patched`
+`make build`. `make build` / `make configure` depend on `.wj-patched`
 (the `$(PATCH_STAMP)` target in the Makefile), which:
 
 1. applies each `patches/*.patch` in file-name order, skipping any that is already
@@ -717,3 +717,58 @@ nor the host account (and no real stack). Previously every shape above
 hard-crashed the pthread. The bound is conservative by design
 (defensive floor); raise `GECKO_HOSTLIMIT` or lower `GECKO_HOSTCOST`
 if a real site needs deeper legit boundary nesting.
+
+## 0014-wasmjit-pbl-inloop-call.patch
+
+IC-dispatched scripted calls (`CallScriptedFunction` via `INVOKE_IC(Call)`)
+used `PBL_CALL_INTERP` -- a C++ recursive call to `PortableBaselineInterpret`
+costing ~10KB of real stack per level. On x.com-shaped workloads the
+PBL->WJ->helper->`JS::Call`->`RunScript`->PBL ping-pong exhausted the host
+account in ~120 levels and React's fiber walk died with `InternalError`
+before mount, even though `GECKO_WJ_DEPTHLIMIT=1` (everything on PBL)
+mounts it fine.
+
+Non-native, non-constructing, non-specialized scripted calls now build the
+callee frame directly on the PBL shadow stack: pushExitFrame (BaselineStub
+boundary), arg copy with underflow padding, callee token + BaselineStub
+descriptor + fake return address, pushFrame, switch ctx.frame/ctx.sp_, set
+`ctx.inLoopSwitch`. `INVOKE_IC` detects the flag and jumps to the new
+`inloop_switch` label, which finishes the callee prologue exactly like the
+call-op fast path (nfixed undefined padding, env objects, debuggee,
+interrupt, coverage) and dispatches. The existing `RetRval` path pops the
+callee frame + synthetic boundary and resumes the caller's IC state, so
+no C++ recursion and no real-stack cost per call level.
+
+- `GECKO_WJ_NOINLOOP=1` reverts to `PBL_CALL_INTERP` (A/B testing).
+- Before building the PBL frame the path still attempts
+  `WasmJitRunCall` (hot callee stays WJ); the wasm attempt publishes
+  `portableBaselineStack().top`/`jsExitFP`/`ctx.stack.fp` under a strict
+  save/restore. `wjr==1` (handled) and `wjr==2` (threw) both pop the exit
+  frame -- missing that pop leaked `ctx.stack.fp` into the caller operand
+  area and corrupted the next frame walk (octane richards OOB).
+- `ReportOverRecursed` failures run inside `PUSH_IC_FRAME()` so a covering
+  VM frame exists on the error path.
+
+Stack-accounting invariant that bit us during development:
+`portableBaselineStack().top` is the activation's published floor; writes
+are only valid inside a protected VM/native/wasm boundary window with a
+paired restore. An early version wrote `top = sp` at `inloop_switch` with
+no restore: each subsequent fresh PBL activation (`Stack` ctor reads `top`,
+`PortablebaselineInterpreterStackCheck` budgets from it) started 264-528B
+deeper per call -- `arr.flat`-shaped recursion ratcheted ~300B/call until
+`InternalError` at ~6k iterations. Removed; ordinary execution now leaves
+`top` untouched and leak reproducers run 20000 iterations flat.
+
+Measured (embed): polyrec 10000-frame polymorphic chain completes
+(r:10000 exact), underflow+recursion leak13 `done 20000`,
+`arr.flat`-based kitchen-sink3 completes (previously InternalError at
+i=6271), bound-function recursion now throws catchable InternalError
+instead of an uncatchable trap. Full micro suite 23/23, realapp acorn +
+marked OK, octane all 11 benches run, wiki:dom 2789 -> 1097 ms/iter.
+ON/OFF (`GECKO_WJ_NOINLOOP=1`) microbench medians are within noise.
+
+Known gaps (unchanged from before): `CallBoundScriptedFunction` and
+getter/setter calls still use `PBL_CALL_INTERP` -- their return-continuation
+operand counts differ from the Call convention (bound-arg expansion,
+GetProp vs argc+2) and need the caller-operand rewrite before they can
+share this path.
