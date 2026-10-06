@@ -101,6 +101,10 @@ env:
   NO_WASM_OPT: ${{ inputs.no_wasm_opt || '0' }}   # '1' skips build-lib.sh's wasm-opt pass
   PRUNE_OBJDIR: ${{ inputs.prune_objdir || '1' }}  # only acted on when IS_HOSTED anyway
   SWAP_GB: ${{ inputs.swap_gb || '16' }}
+  # sccache: use the GitHub Actions cache backend (the action installs the
+  # binary but does NOT export this itself -> without it sccache silently
+  # falls back to a local-disk cache that dies with the ephemeral runner).
+  SCCACHE_GHA_ENABLED: 'on'
 
 jobs:
   build:
@@ -267,12 +271,11 @@ jobs:
       # emcc + host clang locally), so installing it here turns a patches/**
       # cache miss into a mostly-warm compile: content-hashed inputs mean patch
       # reverts/removals can never reuse stale objects (unlike mtime games).
-      # Backed by the Actions cache service; hit stats print at job end.
+      # Backed by the Actions cache service (SCCACHE_GHA_ENABLED in job env).
       - name: Set up sccache (compiler cache for engine builds)
         uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: v0.18.0
-          stats: true
 
       # em_config is committed and portable (reads $EMSDK; binaryen defaults to the
       # emsdk's bundled $EMSDK/upstream), so no shim or config generation is needed.
@@ -314,6 +317,13 @@ jobs:
         run: |
           ulimit -s unlimited || ulimit -s 524288 || true
           make build RELEASE=1
+
+      # Real hit-rate numbers: the sccache server self-terminates after ~10 min
+      # idle, so by the action's post-step it reports a fresh 0-counter. Query it
+      # immediately after the build while it is still warm.
+      - name: sccache compile stats (warm server)
+        if: steps.engine.outputs.skip != 'true'
+        run: sccache --show-stats || true
 
       # Step 2/3: reclaim disk. Once libxul.so is relinked the ~26 GB of .o/.a files
       # are dead for this run, and the gecko.js build only reads dist/include,
