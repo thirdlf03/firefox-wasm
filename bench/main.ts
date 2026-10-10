@@ -173,25 +173,34 @@ function octaneFiles(name: string): string[] | null {
 function runOctane(names: string[], f: ReturnType<typeof parseFlags>) {
   const list = names.length ? names : OCT_DEFAULT;
   console.log('# octane (OCTSCORE, higher=better)' + (f.ab ? '  [jit / pbl = ratio]' : f.pbl ? '  [PBL]' : '  [JIT]'));
+  const ratios: number[] = [];
+  let excluded = 0;
   for (const name of list) {
     const files = octaneFiles(name);
     if (!files) { console.log(pad(name) + 'UNKNOWN (try: list)'); continue; }
     const doRun = (pbl: boolean): { score: number | null; err: string | null; raw: Run } => {
       const r = runEmbed(files, { env: baseEnv(f, pbl), timeoutS: f.timeoutS });
-      const err = grab(r.out, /ERR=(\S+)/) ?? (r.code ? `exit${r.code}` : null);
+      const errLine = r.out.match(/\bERR=([^\n]*)/);
       const sc = grab(r.out, /OCTSCORE=(\d+)/);
-      return { score: sc ? +sc : null, err: err && !sc ? err : null, raw: r };
+      const err = errLine ? errLine[1].trim() : (r.code ? `exit${r.code}` : null);
+      return { score: sc ? +sc : null, err: sc ? null : err, raw: r };
     };
     if (f.ab) {
       const j = doRun(false), p = doRun(true);
-      const ratio = j.score && p.score ? (j.score / p.score).toFixed(2) + 'x' : 'n/a';
-      console.log(pad(name) + `jit=${j.score ?? j.err}  pbl=${p.score ?? p.err}  => ${ratio}`
+      const ratio = j.score && p.score ? (j.score / p.score) : null;
+      if (ratio != null && !j.err && !p.err) ratios.push(ratio);
+      else excluded++;
+      console.log(pad(name) + `jit=${j.score ?? 'ERR'}  pbl=${p.score ?? 'ERR'}  => ${ratio != null ? ratio.toFixed(2) + 'x' : 'n/a'}`
+        + `  work jit=${j.score ?? '-'} pbl=${p.score ?? '-'}  errors jit=${j.err ?? '-'} pbl=${p.err ?? '-'}`
         + (f.bails ? `   bails: ${bailSurvey(j.raw.err)}` : ''));
     } else {
       const x = doRun(f.pbl);
-      console.log(pad(name) + (x.score ?? `ERR ${x.err}`) + (f.bails ? `   bails: ${bailSurvey(x.raw.err)}` : ''));
+      console.log(pad(name) + (x.score != null ? String(x.score) : 'ERR')
+        + `  work=${x.score ?? '-'}  errors=${x.err ?? '-'}`
+        + (f.bails ? `   bails: ${bailSurvey(x.raw.err)}` : ''));
     }
   }
+  if (f.ab) printGeo('octane', ratios, excluded);
 }
 
 function runJetstream(names: string[], f: ReturnType<typeof parseFlags>) {
@@ -223,6 +232,31 @@ function runJetstream(names: string[], f: ReturnType<typeof parseFlags>) {
   }
 }
 
+// Geometric mean of JIT/PBL speedups. Checksum mismatches are excluded: a wrong
+// answer is not a faster engine. Ratios <= 0 or non-finite are excluded too.
+function geoMean(ratios: number[]): { mean: number | null; n: number } {
+  const xs = ratios.filter((r) => r > 0 && Number.isFinite(r));
+  if (!xs.length) return { mean: null, n: 0 };
+  const log = xs.reduce((a, r) => a + Math.log(r), 0) / xs.length;
+  return { mean: Math.exp(log), n: xs.length };
+}
+function printGeo(label: string, ratios: number[], excluded: number) {
+  const g = geoMean(ratios);
+  console.log(`# ${label} geomean=${g.mean != null ? g.mean.toFixed(3) + 'x' : 'n/a'}  n=${g.n}  excluded=${excluded}`);
+}
+
+type MicroRun = { per: string | null; sum: string | null; err: string | null; raw: Run };
+function microRun(files: string[], f: ReturnType<typeof parseFlags>, pbl: boolean): MicroRun {
+  const r = runEmbed(files, { env: baseEnv(f, pbl), timeoutS: f.timeoutS });
+  const errLine = r.out.match(/\bERR=([^\n]*)/);
+  return {
+    per: grab(r.out, /perIter=([\d.]+)/),
+    sum: grab(r.out, /MICROSUM=(-?\d+)/),
+    err: errLine ? errLine[1].trim() : (r.code ? `exit${r.code}` : null),
+    raw: r,
+  };
+}
+
 function runMicro(names: string[], f: ReturnType<typeof parseFlags>) {
   const all = fs.readdirSync(MICRO).filter((x) => x.endsWith('.js') && x !== 'micro-driver.js').map((x) => x.slice(0, -3)).sort();
   const list = names.length ? names : all;
@@ -230,27 +264,61 @@ function runMicro(names: string[], f: ReturnType<typeof parseFlags>) {
   const driver = path.join(MICRO, 'micro-driver.js');
   console.log(`# microbenches (perIter ms, lower=better; iters=${f.iters} warm=${f.warm})`
     + (f.ab ? '  [pbl/jit ratio + sum diff]' : f.pbl ? '  [PBL]' : '  [JIT]'));
+  const ratios: number[] = [];
+  let excluded = 0;
   for (const name of list) {
     const bench = path.join(MICRO, `${name}.js`);
     if (!fs.existsSync(bench)) { console.log(pad(name) + 'UNKNOWN'); continue; }
     const files = [prelude, bench, driver];
-    const doRun = (pbl: boolean) => {
-      const r = runEmbed(files, { env: baseEnv(f, pbl), timeoutS: f.timeoutS });
-      return { per: grab(r.out, /perIter=([\d.]+)/), sum: grab(r.out, /MICROSUM=(-?\d+)/),
-        err: /\bERR=/.test(r.out) ? (grab(r.out, /ERR=(\S+)/) ?? 'err') : (r.code ? `exit${r.code}` : null), raw: r };
-    };
     if (f.ab) {
-      const j = doRun(false), p = doRun(true);
-      const ratio = j.per && p.per ? (+p.per / +j.per).toFixed(2) + 'x' : 'n/a';
+      const j = microRun(files, f, false), p = microRun(files, f, true);
+      const ratio = j.per && p.per ? (+p.per / +j.per) : null;
+      const matched = j.sum != null && p.sum != null && j.sum === p.sum && !j.err && !p.err;
       const diff = j.sum != null && p.sum != null ? (j.sum === p.sum ? 'OK' : `*** MISMATCH jit=${j.sum} pbl=${p.sum}`) : '?';
-      console.log(pad(name) + `jit=${j.per ?? j.err}ms  pbl=${p.per ?? p.err}ms  => ${ratio}  ${diff}`
+      if (matched && ratio != null) ratios.push(ratio);
+      else excluded++;
+      console.log(pad(name) + `jit=${j.per ?? 'ERR'}ms  pbl=${p.per ?? 'ERR'}ms  => ${ratio != null ? ratio.toFixed(2) + 'x' : 'n/a'}  ${diff}`
+        + `  work jit=${j.sum ?? '-'} pbl=${p.sum ?? '-'}  errors jit=${j.err ?? '-'} pbl=${p.err ?? '-'}`
         + (f.bails ? `   bails: ${bailSurvey(j.raw.err)}` : ''));
     } else {
-      const x = doRun(f.pbl);
-      console.log(pad(name) + (x.per != null ? `${x.per}ms  sum=${x.sum}` : `ERR ${x.err}`)
+      const x = microRun(files, f, f.pbl);
+      console.log(pad(name) + (x.per != null ? `${x.per}ms` : 'ERR')
+        + `  work=${x.sum ?? '-'}  errors=${x.err ?? '-'}`
         + (f.bails ? `   bails: ${bailSurvey(x.raw.err)}` : ''));
     }
   }
+  if (f.ab) printGeo('micro', ratios, excluded);
+}
+
+// spa.js is the scored SPA. app.js is an unfinished draft with no Benchmark
+// class, so it cannot produce MICROSUM / a ratio.
+function runSpa(f: ReturnType<typeof parseFlags>) {
+  const prelude = preludeFile(f.iters, f.warm);
+  const bench = path.join(BENCH, 'spa', 'spa.js');
+  const driver = path.join(MICRO, 'micro-driver.js');
+  if (!fs.existsSync(bench)) { console.log(pad('spa') + 'MISSING bench/spa/spa.js'); return; }
+  console.log(`# spa (bench/spa/spa.js; perIter ms, lower=better; iters=${f.iters} warm=${f.warm})`
+    + (f.ab ? '  [pbl/jit ratio]' : f.pbl ? '  [PBL]' : '  [JIT]'));
+  const files = [prelude, bench, driver];
+  const ratios: number[] = [];
+  let excluded = 0;
+  if (f.ab) {
+    const j = microRun(files, f, false), p = microRun(files, f, true);
+    const ratio = j.per && p.per ? (+p.per / +j.per) : null;
+    const matched = j.sum != null && p.sum != null && j.sum === p.sum && !j.err && !p.err;
+    const diff = j.sum != null && p.sum != null ? (j.sum === p.sum ? 'OK' : `*** MISMATCH jit=${j.sum} pbl=${p.sum}`) : '?';
+    if (matched && ratio != null) ratios.push(ratio);
+    else excluded++;
+    console.log(pad('spa') + `jit=${j.per ?? 'ERR'}ms  pbl=${p.per ?? 'ERR'}ms  => ${ratio != null ? ratio.toFixed(2) + 'x' : 'n/a'}  ${diff}`
+      + `  work jit=${j.sum ?? '-'} pbl=${p.sum ?? '-'}  errors jit=${j.err ?? '-'} pbl=${p.err ?? '-'}`
+      + (f.bails ? `   bails: ${bailSurvey(j.raw.err)}` : ''));
+  } else {
+    const x = microRun(files, f, f.pbl);
+    console.log(pad('spa') + (x.per != null ? `${x.per}ms` : 'ERR')
+      + `  work=${x.sum ?? '-'}  errors=${x.err ?? '-'}`
+      + (f.bails ? `   bails: ${bailSurvey(x.raw.err)}` : ''));
+  }
+  if (f.ab) printGeo('spa', ratios, excluded);
 }
 
 function runUbo(f: ReturnType<typeof parseFlags>) {
@@ -437,6 +505,7 @@ function main() {
     case 'octane': return runOctane(f.rest, f);
     case 'jetstream': case 'js': return runJetstream(f.rest, f);
     case 'micro': case 'microbenches': return runMicro(f.rest, f);
+    case 'spa': return runSpa(f);
     case 'ubo': return runUbo(f);
     case 'realapp': return runRealapp(f.rest[0] ?? 'all', f);
     case 'disas': return runDisas(f.rest, f);
@@ -444,6 +513,7 @@ function main() {
     case 'wasm': return runWasm(f.rest, f);
     case 'jittest': return runJittest(f.rest, f);
     case 'list':
+      console.log('spa:       bench/spa/spa.js');
       console.log('octane:    ' + Object.keys(OCT).join(' '));
       console.log('jetstream: ' + fs.readdirSync(JETSTREAM).filter((x) => x.endsWith('.js') && x !== 'jetstream-driver.js').map((x) => x.slice(0, -3)).join(' '));
       console.log('micro:     ' + fs.readdirSync(MICRO).filter((x) => x.endsWith('.js') && x !== 'micro-driver.js').map((x) => x.slice(0, -3)).join(' '));
@@ -452,7 +522,7 @@ function main() {
       console.log('realapp:   acorn marked');
       return;
     default:
-      console.error('usage: node bench/main.ts <octane|jetstream|micro|ubo|realapp|disas|disastest|wasm|jittest|list> [names...] [flags]\n'
+      console.error('usage: node bench/main.ts <octane|jetstream|micro|spa|ubo|realapp|disas|disastest|wasm|jittest|list> [names...] [flags]\n'
         + '  disas <file.js> --fn NAME [--grep RE]   show the WAT the JIT emitted for a function\n'
         + '  disastest [names]                       run bench/disas/*.js codegen CHECK tests\n'
         + '  flags: --pbl --ab --bails --iters N --warm N --gczeal N --nursery-mb N --timeout S');

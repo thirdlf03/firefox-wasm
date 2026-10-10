@@ -1,0 +1,90 @@
+--- a/js/src/wasm/WasmJitBackend.cpp
++++ b/js/src/wasm/WasmJitBackend.cpp
+@@ -310,6 +310,10 @@
+   const CompileInfo* info = nullptr;  // slot layout for resume points
+   MResumePoint* curRp = nullptr;      // resume point for the instruction being emitted
+   std::unordered_map<MBasicBlock*, MResumePoint*> blockExitRp;  // each block's exit rp (rp-fallback for null entryResumePoint)
++  // Sunk unbox tag guards (see Opcode::Unbox): consuming block -> [(inputLocal, tag)].
++  std::unordered_map<const MBasicBlock*,
++                     std::vector<std::pair<uint32_t, uint32_t>>>
++      sunkGuards;
+   std::unordered_map<uint32_t, uintptr_t> nurseryObjSlot;  // NurseryObject node id -> traced const-pool slot (rematerialize, never cache: a minor GC moves the object, the slot is traced/current, a cached local goes stale -- the deltablue-under-inlining corruption)
+   uint32_t curOp = 0;                 // op() of the instruction being emitted (deopt histogram)
+   uint32_t deoptCallLine = 0;         // __LINE__ of the EmitDeopt call (deopt-line histogram)
+@@ -5384,13 +5388,59 @@
+         }
+         if (onlyGenericCmps) fallible = false;
+       }
++      // Sink a fallible pointer-type Unbox's tag guard to the head of each
++      // consuming block when no use is in this block: a def-site guard runs on
++      // paths that never reach a use (ArrayFrom: `Unbox(mapfn)` sits in the
++      // for-of preheader while its only use is in the mapping arm, so every
++      // Array.from(set) without a mapfn deopts once per call -- ~3k/iter on
++      // spa). The guard still runs before any use executes. All-or-nothing: a
++      // same-block / phi / non-dominated / no-entry-rp use keeps the def-site
++      // guard. GECKO_WJ_NOSUNKUNBOX reverts.
++      if (fallible && u->input()->type() == MIRType::Value &&
++          (u->type() == MIRType::Object || u->type() == MIRType::String ||
++           u->type() == MIRType::Symbol || u->type() == MIRType::BigInt)) {
++        static int noSink = WJGETENV("GECKO_WJ_NOSUNKUNBOX") ? 1 : 0;
++        if (!noSink) {
++          MBasicBlock* defBlk = ins->block();
++          std::vector<MBasicBlock*> useBlks;
++          bool sinkable = true;
++          for (jit::MUseIterator ui = u->usesBegin(); ui != u->usesEnd(); ui++) {
++            if (!ui->consumer()->isDefinition()) {
++              sinkable = false;
++              break;
++            }
++            MDefinition* cd = ui->consumer()->toDefinition();
++            MBasicBlock* ub = cd->block();
++            if (ub == defBlk || cd->op() == MDefinition::Opcode::Phi ||
++                !defBlk->dominates(ub) || !ub->entryResumePoint()) {
++              sinkable = false;
++              break;
++            }
++            if (std::find(useBlks.begin(), useBlks.end(), ub) == useBlks.end())
++              useBlks.push_back(ub);
++          }
++          if (sinkable && !useBlks.empty()) {
++            uint32_t tag =
++                u->type() == MIRType::Object  ? TagWord(JSVAL_TYPE_OBJECT)
++                : u->type() == MIRType::String ? TagWord(JSVAL_TYPE_STRING)
++                : u->type() == MIRType::Symbol ? TagWord(JSVAL_TYPE_SYMBOL)
++                                             : TagWord(JSVAL_TYPE_BIGINT);
++            for (MBasicBlock* ub : useBlks)
++              be.sunkGuards[ub].push_back({uint32_t(inLocal), tag});
++            fallible = false;
++          }
++        }
++      }
+       {
+         static int ubDbg = WJGETENV("GECKO_WJ_UNBOXDBG")
+                                ? atoi(getenv("GECKO_WJ_UNBOXDBG"))
+                                : 0;
+         if (ubDbg && be.info && be.info->script() &&
+             int(be.info->script()->lineno()) == ubDbg && fallible) {
+-          fprintf(stderr, "[wj-ub] unbox in->op=%s inTy=%s ->ty=%s uses:",
++          jsbytecode* rpc = be.curRp ? be.curRp->pc() : nullptr;
++          JSScript* us = be.info->script();
++          fprintf(stderr, "[wj-ub] unbox pc=%d in->op=%s inTy=%s ->ty=%s uses:",
++                  rpc && us->containsPC(rpc) ? int(rpc - us->code()) : -1,
+                   WJOpName(u->input()->op()),
+                   StringFromMIRType(u->input()->type()),
+                   StringFromMIRType(u->type()));
+@@ -14951,6 +15001,15 @@
+     if (it != be.blockExitRp.end()) lastRp = it->second;
+   }
+   be.curRp = lastRp;  // valid even for an empty block (terminator uses it)
++  // Deferred unbox tag guards targeting this block (see Opcode::Unbox): run at
++  // the head under the block-entry rp, before any consuming op.
++  if (auto sg = be.sunkGuards.find(b); sg != be.sunkGuards.end()) {
++    for (auto& [loc, tag] : sg->second) {
++      be.curOp = uint32_t(MDefinition::Opcode::Unbox);
++      if (!EmitTagGuardLocal(e, be, loc, tag)) return false;
++    }
++    be.sunkGuards.erase(sg);
++  }
+   for (MInstructionIterator it = b->begin(); it != b->end(); it++) {
+     MInstruction* ins = *it;
+     if (ins->isControlInstruction()) continue;

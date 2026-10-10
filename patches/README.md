@@ -772,3 +772,120 @@ getter/setter calls still use `PBL_CALL_INTERP` -- their return-continuation
 operand counts differ from the Call convention (bound-arg expansion,
 GetProp vs argc+2) and need the caller-operand rewrite before they can
 share this path.
+
+## 0015-wasmjit-rope-charcodeat.patch
+
+Inline `charCodeAt` deopted the whole function when the string was a rope
+(`LINEAR_BIT` clear). `string-ops` builds `base + i` (a rope) and then
+walks it with `charCodeAt`, so the compiled function never stayed in JIT
+(1.01x vs PBL). The rope arm now calls `WJH_CHARCODEAT`, which flattens
+and returns the code, and the rest of the function stays compiled. The
+next index sees `LINEAR_BIT` and takes the inline load.
+`GECKO_WJ_NOROPECCA=1` restores the deopt.
+
+Measured (embed, iters=8 warm=2): string-ops jit 139.5ms / pbl 313.3ms =
+2.25x, checksum OK (was 279.3 / 283.0 = 1.01x). Same binary with
+`GECKO_WJ_NOROPECCA=1` is 376.5ms. spa.js (iters=10 warm=2) stays
+checksum-OK: jit 164.1 / pbl 325.6 = 1.98x, vs 174.7ms with the opt-out.
+
+## 0016-wasmjit-short-rope.patch
+
+Inline string `+` only built a rope when the result was longer than a fat
+inline Latin-1 string (24). Shorter pairs fell through to
+`WJH_BINARYARITH` / `ConcatStrings`, which copies into an inline string.
+spa's html builder and `concat-short` are mostly those short pairs.
+`JSRope::new_` has no minimum length, so the same nursery bump now ropes
+any two non-empty strings. `GECKO_WJ_NOSHORTROPE=1` restores the >24 gate.
+
+Measured (embed, iters=30 warm=3): concat-short jit 26.5ms / pbl 39.4ms =
+1.48x, checksum OK (opt-out 30.5 / 39.3 = 1.29x). spa.js (iters=10 warm=2)
+jit 130.4 / pbl 281.7 = 2.16x, checksum OK, vs 149.7ms with the opt-out.
+Helper histogram: `BINARITH` fell from ~38% of wjhelp calls to ~15%.
+
+## 0017-wasmjit-int-string-rope.patch
+
+`string + int` and `int + string` still went through `WJH_BINARYARITH`
+(`AddValues` -> `ToString` -> `ConcatStrings`). Decimal atoms for
+0..255 are permanent (`StaticStrings::intStaticTable`). When one Add
+operand is a string and the other is an int32 in that range, the JIT
+loads the atom and builds the same nursery rope as string+string.
+`GECKO_WJ_NOINTSTR=1` skips it. `intStaticTableBase()` exposes the table.
+
+Measured (embed): concat-short (`"ab"+(i&7)+"cdef"+(i&3)`, iters=30
+warm=3) jit 2.9ms / pbl 44.1ms = 15.22x, checksum OK (was 26.5 / 39.4 =
+1.48x with short ropes only). string-ops stays checksum-OK at 2.37x.
+spa.js (iters=10 warm=2) jit 151.0 / pbl 320.4 = 2.12x, checksum OK, vs
+166.0ms with the opt-out.
+
+## 0018-wasmjit-fast-replace.patch
+
+`escapeHtml` is `String(s).replace(/[&<>"']/g, fn)`. A global replace
+that matches nothing still runs `RegExpReplace` →
+`RegExpGlobalReplaceOptFunc` → `Substring` (about 39k times per spa
+iteration). `String_replace`'s prologue now calls `WJH_FASTREPLACE`.
+For a global character class (no ignoreCase/unicode/sticky/hasIndices,
+latin1 members, no ranges, no negated class) the helper walks the rope
+and, on no match, zeros `lastIndex` and returns the input string. Any
+other regexp, or a hit, falls through to the existing body.
+`GECKO_WJ_NOFASTREPLACE=1` restores the old path.
+
+Measured (embed, iters=10 warm=2, work=2611977780, errors none): spa.js
+jit 115.5ms / pbl 307.5ms = 2.66x and jit 115.1 / pbl 293.6 = 2.55x.
+Same binary with `GECKO_WJ_NOFASTREPLACE=1`: jit 147.2 / pbl 304.7 =
+2.07x. concat-short (iters=30 warm=3) stays 15.96x, work=1600000.
+string-ops (iters=10 warm=2) 2.48x, work=635020377. octane regexp
+(iters=5 warm=1) stays 1.31x.
+
+## 0019-wasmjit-sink-unbox-guard.patch
+
+A fallible `Unbox` emits its tag guard where the MIR node sits, even when
+every use is in a later block. LICM hoisted `Unbox(mapfn -> Object)` out of
+`ArrayFrom`'s for-of loop into the preheader: the only consumer is the
+`callContentFunction(mapfn, ...)` arm, so `Array.from(set)` with no mapfn
+hit the Object tag guard on `undefined` and deopted the function to PBL
+once per call (~3k/iter on spa, ~99% of all resumes).
+
+When no use is in the Unbox's own block and every real use is a
+non-phi definition in a strictly-dominated block with an entry resume
+point, the backend now emits the unguarded conversion at the def and the
+tag guard at the head of each consuming block (under that block's entry
+resume point). The guard still runs before any use executes; paths that
+never consume the value skip it. `GECKO_WJ_NOSUNKUNBOX=1` restores the
+def-site guard. `[wj-ub]` prints the resume-pc offset for site matching.
+
+Measured (embed, iters=10 warm=2, work=2611977780, errors none): spa.js
+jit 61.5ms / pbl 193.5ms = 3.15x (was jit 65.4 / pbl 188.2 = 2.88x on the
+same binary before this patch; the ArrayFrom Unbox deopt count went from
+13112 in 5 runs to 0). micro suite 23/23 checksums OK.
+
+Repeated `node bench/main.ts spa --ab --iters 10 --warm 2` runs after this
+patch (16 samples): per-run ratios 2.89-3.23, median ~3.09 -- every run
+above the 2.882x goal.
+
+## Status / handoff (2026-10-10)
+
+- spa goal (>= 2.882x over >=10 iters): **met** by 0019 (see above).
+- Real-site validation: **not done yet**. The full `make build` for the
+  browser engine was interrupted mid-compile (host too loaded). To resume:
+  `make build` (incremental -- compiled objects are kept), then
+  `make libxul` + `make embed-demo` (or `chrome-demo`) and recheck x.com /
+  youtube.com. Previous sign-off predates patches 0015-0019.
+- Patch-verify gotcha: `vendor-std-deps.py` generates crate dirs under
+  `firefox/third_party/rust/<crate>-<ver>/`; the `.wj-patched` verify step
+  runs `git status --porcelain` inside `firefox/`, sees them as tree
+  divergence, and fails with "engine patches do NOT match the pinned
+  revision" even though every patch reverse-applies cleanly. Workaround
+  (machine-local, not committed): add the generated dirs to
+  `firefox/.git/info/exclude`. A durable fix would make the verify step
+  ignore untracked files under `third_party/rust/`.
+- Next call-miss candidates (GECKO_WJ_CALLMISS on spa, ~1M misses/14 runs,
+  `notInterp` dominant -- native callees always take `WJNativeCall`'s
+  RootedValueArray + CallArgs + AutoRealm plumbing):
+  - `keys.sort()` in `sortedPropKeys` (spa.js:406, ~31k/iter)
+  - `String(props[k])` in `serializeNode` (spa.js:541/554, ~22k/iter)
+  - `toFixed` in `dec` (spa.js:102), `key.split('.')` in `translate`
+    (spa.js:752) smaller.
+  Direction: extend `WJTryNativeFast` -- e.g. a `String()` fast path that
+  handles primitive args without the CallArgs machinery (arg is almost
+  always a string/int already), or a dense default-comparator
+  `Array.prototype.sort` fast path.
