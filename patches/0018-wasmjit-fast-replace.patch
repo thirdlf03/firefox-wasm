@@ -1,0 +1,195 @@
+diff --git a/js/src/wasm/WasmJitBackend.h b/js/src/wasm/WasmJitBackend.h
+--- a/js/src/wasm/WasmJitBackend.h
++++ b/js/src/wasm/WasmJitBackend.h
+@@ -231,6 +231,9 @@
+   WJH_PROXYSET = 157,                // scratch[0]=proxy,[1]=id(boxed),[2]=rhs, site bit0=strict -> void; js::ProxySetProperty
+   WJH_PROXYGETBYVALUE = 158,         // scratch[0]=proxy,[1]=idVal -> Value; js::ProxyGetPropertyByValue
+   WJH_PROXYSETBYVALUE = 159,         // scratch[0]=proxy,[1]=idVal,[2]=rhs, site bit0=strict -> void; js::ProxySetPropertyByValue
++  WJH_FASTREPLACE = 160,             // String_replace prologue: scratch[kWJThisSlot]=string,
++                                     // scratch[0]=search. 0.0 = no-match global char-class,
++                                     // result is the input string. 3.0 = not handled.
+ };
+ // MNewLexicalEnvironmentObject: the LexicalScope* baked from the template object.
+ extern uint32_t gWJLexScope;
+diff --git a/js/src/wasm/WasmJitBackend.cpp b/js/src/wasm/WasmJitBackend.cpp
+--- a/js/src/wasm/WasmJitBackend.cpp
++++ b/js/src/wasm/WasmJitBackend.cpp
+@@ -16036,6 +16036,23 @@
+   return e.writeOp(Op::End);
+ }
+ 
++static bool WJIsStringReplace(JSScript* sc) {
++  if (!sc || !sc->filename() || !strstr(sc->filename(), "self-hosted")) return false;
++  // Pinned self-hosted line of String_replace (obj selfhosted.js). The atom
++  // check covers a regenerated line number.
++  if (sc->lineno() == 4307) return true;
++  JSFunction* f = sc->function();
++  if (!f) return false;
++  JSAtom* a = f->maybePartialDisplayAtom();
++  if (!a || !a->hasLatin1Chars() || a->length() != 13) return false;
++  JS::AutoCheckCannotGC nogc;
++  const JS::Latin1Char* c = a->latin1Chars(nogc);
++  const char* name = "String_replace";
++  for (size_t i = 0; i < 13; i++)
++    if (c[i] != uint8_t(name[i])) return false;
++  return true;
++}
++
+ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
+                           bool useThis, WarpSnapshot* snapshot, Encoder& e) {
+   const uint8_t kVoid = 0x40;
+@@ -16702,6 +16719,36 @@
+   // including the OSR resume entry (the runtime re-calls the trampoline, which
+   // always runs this prologue before jumping to the OSR block).
+   if (!EmitDepthCheck(e, be)) return false;
++  // String_replace: a global character-class with no match returns the input.
++  // escapeHtml's /[&<>"']/g is this shape and otherwise walks
++  // replace -> RegExpReplace -> RegExpGlobalReplaceOptFunc -> Substring.
++  if (WJIsStringReplace(mir.outerInfo().script())) {
++    auto stage = [&](uint32_t param, uint32_t off) -> bool {
++      if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(0) ||
++          !e.writeOp(MiscOp::I32TruncSatF64S))
++        return false;
++      if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(param)) return false;
++      return e.writeOp(Op::I64Store) && e.writeVarU32(3) && e.writeVarU32(off);
++    };
++    if (!stage(kWJThisParam, kWJThisOff) || !stage(kWJArg0Param, 0)) return false;
++    if (!e.writeOp(Op::F64Const) ||
++        !e.writeFixedF64(double(WJH_FASTREPLACE)) ||
++        !e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) ||
++        !e.writeOp(Op::Call) || !e.writeVarU32(0))
++      return false;
++    if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0) || !e.writeOp(Op::F64Eq))
++      return false;
++    if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
++    if (!EmitDepthPop(e, be)) return false;
++    if (!e.writeOp(Op::F64Const) || !e.writeFixedF64(0.0)) return false;
++    if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(0) ||
++        !e.writeOp(MiscOp::I32TruncSatF64S))
++      return false;
++    if (!e.writeOp(Op::I64Load) || !e.writeVarU32(3) || !e.writeVarU32(kWJResultOff))
++      return false;
++    if (!e.writeOp(Op::Return)) return false;
++    if (!e.writeOp(Op::End)) return false;
++  }
+   // Persistently GC-root the env for closures: push boxed(envLocal) onto the
+   // GC-root shadow stack at the current gWJRootSP, remember the slot index in
+   // envRootIdx, and bump gWJRootSP. The slot is traced on EVERY GC (minor+major)
+diff --git a/js/src/wasm/WasmJitRuntime.cpp b/js/src/wasm/WasmJitRuntime.cpp
+--- a/js/src/wasm/WasmJitRuntime.cpp
++++ b/js/src/wasm/WasmJitRuntime.cpp
+@@ -2988,6 +2988,106 @@
+   }
+   return r;
+ }
++
++// Global replace of a simple character class that does not match returns the
++// input string (and zeros lastIndex). String_replace's prologue calls this so
++// the common no-match case skips RegExpReplace / searcher / Substring.
++static double WJFastReplace() {
++  static int off = getenv("GECKO_WJ_NOFASTREPLACE") ? 1 : 0;
++  if (off) return 3.0;
++  JSContext* cx = js::TlsContext.get();
++  if (!cx) return 3.0;
++  JS::Value thisv = JS::Value::fromRawBits(gWJScratch[js::wasm::kWJThisSlot]);
++  JS::Value search = JS::Value::fromRawBits(gWJScratch[0]);
++  if (!thisv.isString() || !search.isObject()) return 3.0;
++  JSObject* obj = &search.toObject();
++  if (!js::IsOptimizableRegExpObject(obj, cx)) return 3.0;
++  js::RegExpObject& rx = obj->as<js::RegExpObject>();
++  JS::RegExpFlags flags = rx.getFlags();
++  if (!flags.global() || flags.ignoreCase() || flags.unicode() ||
++      flags.unicodeSets() || flags.sticky() || flags.hasIndices()) {
++    return 3.0;
++  }
++  JSAtom* src = rx.getSource();
++  if (!src || src->length() < 3 || src->length() > 64) return 3.0;
++  char16_t buf[64];
++  size_t n = src->length();
++  {
++    JS::AutoCheckCannotGC nogc;
++    if (src->hasLatin1Chars()) {
++      const JS::Latin1Char* p = src->latin1Chars(nogc);
++      for (size_t i = 0; i < n; i++) buf[i] = p[i];
++    } else {
++      const char16_t* p = src->twoByteChars(nogc);
++      for (size_t i = 0; i < n; i++) buf[i] = p[i];
++    }
++  }
++  if (buf[0] != '[' || buf[n - 1] != ']' || buf[1] == '^') return 3.0;
++  uint8_t set[128] = {};
++  bool any = false;
++  for (size_t i = 1; i + 1 < n;) {
++    char16_t ch = buf[i];
++    if (ch == '\\') {
++      if (i + 2 >= n) return 3.0;
++      char16_t e = buf[i + 1];
++      if (e == 'n') ch = '\n';
++      else if (e == 't') ch = '\t';
++      else if (e == 'r') ch = '\r';
++      else if (e == '\\' || e == ']' || e == '[' || e == '-' || e == '^' ||
++               e == '.')
++        ch = e;
++      else
++        return 3.0;
++      i += 2;
++    } else if (ch == '-') {
++      return 3.0;
++    } else {
++      i += 1;
++    }
++    if (ch >= 128) return 3.0;
++    set[ch] = 1;
++    any = true;
++  }
++  if (!any) return 3.0;
++  std::vector<JSString*> pending;
++  pending.push_back(thisv.toString());
++  while (!pending.empty()) {
++    if (pending.size() > 2048) return 3.0;
++    JSString* cur = pending.back();
++    pending.pop_back();
++    if (!cur->isLinear()) {
++      JSRope& rope = cur->asRope();
++      pending.push_back(rope.leftChild());
++      pending.push_back(rope.rightChild());
++      continue;
++    }
++    JSLinearString* lin = &cur->asLinear();
++    JS::AutoCheckCannotGC nogc;
++    if (lin->hasLatin1Chars()) {
++      const JS::Latin1Char* p = lin->latin1Chars(nogc);
++      size_t len = lin->length();
++      for (size_t i = 0; i < len; i++) {
++        if (p[i] < 128 && set[p[i]]) return 3.0;
++      }
++    } else {
++      const char16_t* p = lin->twoByteChars(nogc);
++      size_t len = lin->length();
++      for (size_t i = 0; i < len; i++) {
++        if (p[i] < 128 && set[p[i]]) return 3.0;
++      }
++    }
++  }
++  rx.zeroLastIndex(cx);
++  gWJScratch[js::wasm::kWJResultSlot] = thisv.asRawBits();
++  static int dbg = getenv("GECKO_WJ_FASTREPLACEDBG") ? 1 : 0;
++  if (dbg) {
++    static uint64_t hits = 0;
++    if ((++hits % 100000) == 0)
++      fprintf(stderr, "[wj-fastreplace] hits=%llu\n", (unsigned long long)hits);
++  }
++  return 0.0;
++}
++
+ static double wjhelpImpl(double kindF, double siteF) {
+   int kind = int(kindF);
+   // DEBUG (GECKO_WJ_VALIDATEHELPER): validate GC-tagged Values staged in the
+@@ -3113,6 +3213,7 @@
+   }
+   JSContext* cx = js::TlsContext.get();
+   if (!cx) return 1.0;
++  if (kind == js::wasm::WJH_FASTREPLACE) return WJFastReplace();
+ 
+   static int helpHist = getenv("GECKO_WJ_HELPHIST") ? 1 : 0;
+   if (helpHist) {
