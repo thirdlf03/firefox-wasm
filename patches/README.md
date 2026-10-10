@@ -857,3 +857,35 @@ Measured (embed, iters=10 warm=2, work=2611977780, errors none): spa.js
 jit 61.5ms / pbl 193.5ms = 3.15x (was jit 65.4 / pbl 188.2 = 2.88x on the
 same binary before this patch; the ArrayFrom Unbox deopt count went from
 13112 in 5 runs to 0). micro suite 23/23 checksums OK.
+
+Repeated `node bench/main.ts spa --ab --iters 10 --warm 2` runs after this
+patch (16 samples): per-run ratios 2.89-3.23, median ~3.09 -- every run
+above the 2.882x goal.
+
+## Status / handoff (2026-10-10)
+
+- spa goal (>= 2.882x over >=10 iters): **met** by 0019 (see above).
+- Real-site validation: **not done yet**. The full `make build` for the
+  browser engine was interrupted mid-compile (host too loaded). To resume:
+  `make build` (incremental -- compiled objects are kept), then
+  `make libxul` + `make embed-demo` (or `chrome-demo`) and recheck x.com /
+  youtube.com. Previous sign-off predates patches 0015-0019.
+- Patch-verify gotcha: `vendor-std-deps.py` generates crate dirs under
+  `firefox/third_party/rust/<crate>-<ver>/`; the `.wj-patched` verify step
+  runs `git status --porcelain` inside `firefox/`, sees them as tree
+  divergence, and fails with "engine patches do NOT match the pinned
+  revision" even though every patch reverse-applies cleanly. Workaround
+  (machine-local, not committed): add the generated dirs to
+  `firefox/.git/info/exclude`. A durable fix would make the verify step
+  ignore untracked files under `third_party/rust/`.
+- Next call-miss candidates (GECKO_WJ_CALLMISS on spa, ~1M misses/14 runs,
+  `notInterp` dominant -- native callees always take `WJNativeCall`'s
+  RootedValueArray + CallArgs + AutoRealm plumbing):
+  - `keys.sort()` in `sortedPropKeys` (spa.js:406, ~31k/iter)
+  - `String(props[k])` in `serializeNode` (spa.js:541/554, ~22k/iter)
+  - `toFixed` in `dec` (spa.js:102), `key.split('.')` in `translate`
+    (spa.js:752) smaller.
+  Direction: extend `WJTryNativeFast` -- e.g. a `String()` fast path that
+  handles primitive args without the CallArgs machinery (arg is almost
+  always a string/int already), or a dense default-comparator
+  `Array.prototype.sort` fast path.
