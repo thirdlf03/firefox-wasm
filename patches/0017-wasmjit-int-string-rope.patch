@@ -1,0 +1,193 @@
+diff --git a/js/src/vm/StaticStrings.h b/js/src/vm/StaticStrings.h
+--- a/js/src/vm/StaticStrings.h
++++ b/js/src/vm/StaticStrings.h
+@@ -100,6 +100,10 @@
+   // table load (no VM helper). Entries are permanent atoms (no GC/rooting hazard).
+   JSAtom** unitStaticTableBase() { return unitStaticTable; }
+ 
++  // Permanent decimal atoms for 0..INT_STATIC_LIMIT-1. Same GC story as
++  // unitStaticTable: the JIT may load intStaticTable[n] and rope it.
++  JSAtom** intStaticTableBase() { return intStaticTable; }
++
+   /* May not return atom, returns null on (reported) failure. */
+   inline JSLinearString* getUnitString(JSContext* cx, char16_t c);
+ 
+diff --git a/js/src/wasm/WasmJitBackend.cpp b/js/src/wasm/WasmJitBackend.cpp
+--- a/js/src/wasm/WasmJitBackend.cpp
++++ b/js/src/wasm/WasmJitBackend.cpp
+@@ -9620,79 +9620,113 @@
+             return e.writeOp(Op::I32Store) && e.writeVarU32(2) &&
+                    e.writeVarU32(off);
+           };
++          // lp/rp hold the child pointers. brDepth counts this caller's ifs
++          // plus eligible plus room, back out to the i64 block.
++          auto emitRopeFromPtrs = [&](uint32_t brDepth) -> bool {
++            if (!ld(lp, lenOff) || !ld(rp, lenOff) || !e.writeOp(Op::I32Add) ||
++                !e.writeOp(Op::LocalSet) || !e.writeVarU32(wl))
++              return false;
++            if (!ld(lp, lenOff) || !I32C(0) || !e.writeOp(Op::I32Ne)) return false;
++            if (!ld(rp, lenOff) || !I32C(0) || !e.writeOp(Op::I32Ne) ||
++                !e.writeOp(Op::I32And))
++              return false;
++            if (!GetLocal(e, wl) || !I32C(minRopeLen) || !e.writeOp(Op::I32GtU) ||
++                !e.writeOp(Op::I32And))
++              return false;
++            if (!GetLocal(e, wl) || !I32C(maxLen) || !e.writeOp(Op::I32LeU) ||
++                !e.writeOp(Op::I32And))
++              return false;
++            if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
++            if (!I32C(posAddr) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
++                !e.writeVarU32(0) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(ap))
++              return false;
++            if (!I32C(posAddr) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
++                !e.writeVarU32(uint32_t(endOff)))
++              return false;
++            if (!GetLocal(e, ap) || !I32C(int32_t(totalSize)) ||
++                !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32GeU))
++              return false;
++            if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
++            if (!I32C(posAddr) || !GetLocal(e, ap) || !I32C(int32_t(totalSize)) ||
++                !e.writeOp(Op::I32Add) || !st(0))
++              return false;
++            if (!GetLocal(e, ap) || !I32C(strHdr) || !st(0)) return false;
++            if (!GetLocal(e, ap) || !I32C(int32_t(hdrSize)) ||
++                !e.writeOp(Op::I32Add) || !e.writeOp(Op::LocalSet) ||
++                !e.writeVarU32(ro))
++              return false;
++            if (!GetLocal(e, ro)) return false;
++            if (!ld(lp, flagsOff) || !I32C(latin1Bit) || !e.writeOp(Op::I32And) ||
++                !ld(rp, flagsOff) || !I32C(latin1Bit) || !e.writeOp(Op::I32And) ||
++                !e.writeOp(Op::I32And))
++              return false;
++            if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32)) ||
++                !I32C(ropeFlagsL1) || !e.writeOp(Op::Else) || !I32C(ropeFlagsTB) ||
++                !e.writeOp(Op::End))
++              return false;
++            if (!st(flagsOff)) return false;
++            if (!GetLocal(e, ro) || !GetLocal(e, wl) || !st(lenOff)) return false;
++            if (!GetLocal(e, ro) || !GetLocal(e, lp) || !st(leftOff)) return false;
++            if (!GetLocal(e, ro) || !GetLocal(e, rp) || !st(rightOff)) return false;
++            if (!GetLocal(e, ro) || !EmitBoxFromStack(e, MIRType::String))
++              return false;
++            if (!e.writeOp(Op::Br) || !e.writeVarU32(brDepth)) return false;
++            if (!e.writeOp(Op::End)) return false;  // end room-if
++            return e.writeOp(Op::End);             // end eligible-if
++          };
++          // string + small int (or int + string). Permanent decimal atoms
++          // 0..255, then the same rope. GECKO_WJ_NOINTSTR keeps the helper.
++          static int noIntStr = WJGETENV("GECKO_WJ_NOINTSTR") ? 1 : 0;
++          JSContext* iscx = js::TlsContext.get();
++          uintptr_t intTable =
++              iscx ? uintptr_t(iscx->staticStrings().intStaticTableBase()) : 0;
++          int32_t intTag = int32_t(TagWord(JSVAL_TYPE_INT32));
++          auto emitIntSide = [&](int32_t strLocal, int32_t intLocal,
++                                 bool intOnRight) -> bool {
++            if (!pushTag(intLocal) || !I32C(intTag) || !e.writeOp(Op::I32Eq))
++              return false;
++            if (!pushTag(strLocal) || !I32C(strTag) || !e.writeOp(Op::I32Eq) ||
++                !e.writeOp(Op::I32And))
++              return false;
++            if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
++            if (!GetLocal(e, uint32_t(intLocal)) || !e.writeOp(Op::I32WrapI64))
++              return false;
++            if (!I32C(int32_t(js::StaticStrings::INT_STATIC_LIMIT)) ||
++                !e.writeOp(Op::I32LtU))
++              return false;
++            if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
++            if (!GetLocal(e, uint32_t(strLocal)) || !e.writeOp(Op::I32WrapI64) ||
++                !e.writeOp(Op::LocalSet) ||
++                !e.writeVarU32(intOnRight ? lp : rp))
++              return false;
++            if (!I32C(int32_t(intTable)) ||
++                !GetLocal(e, uint32_t(intLocal)) || !e.writeOp(Op::I32WrapI64) ||
++                !e.writeOp(Op::I32Const) || !e.writeVarS32(2) ||
++                !e.writeOp(Op::I32Shl) || !e.writeOp(Op::I32Add) ||
++                !e.writeOp(Op::I32Load) || !e.writeVarU32(2) || !e.writeVarU32(0) ||
++                !e.writeOp(Op::LocalSet) ||
++                !e.writeVarU32(intOnRight ? rp : lp))
++              return false;
++            if (!emitRopeFromPtrs(4)) return false;
++            if (!e.writeOp(Op::End)) return false;  // end range-if
++            return e.writeOp(Op::End);             // end tag-if
++          };
++          if (!noIntStr && intTable) {
++            if (!emitIntSide(l0, l1, true)) return false;
++            if (!emitIntSide(l1, l0, false)) return false;
++          }
+           // both strings?
+           if (!pushTag(l0) || !I32C(strTag) || !e.writeOp(Op::I32Eq)) return false;
+           if (!pushTag(l1) || !I32C(strTag) || !e.writeOp(Op::I32Eq)) return false;
+           if (!e.writeOp(Op::I32And)) return false;
+           if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+-          // lp = wrap(l0); rp = wrap(l1)
+           if (!GetLocal(e, uint32_t(l0)) || !e.writeOp(Op::I32WrapI64) ||
+               !e.writeOp(Op::LocalSet) || !e.writeVarU32(lp))
+             return false;
+           if (!GetLocal(e, uint32_t(l1)) || !e.writeOp(Op::I32WrapI64) ||
+               !e.writeOp(Op::LocalSet) || !e.writeVarU32(rp))
+             return false;
+-          // wl = leftLen + rightLen
+-          if (!ld(lp, lenOff) || !ld(rp, lenOff) || !e.writeOp(Op::I32Add) ||
+-              !e.writeOp(Op::LocalSet) || !e.writeVarU32(wl))
+-            return false;
+-          // eligible = leftLen>0 & rightLen>0 & wl>minRopeLen & wl<=maxLen
+-          if (!ld(lp, lenOff) || !I32C(0) || !e.writeOp(Op::I32Ne)) return false;
+-          if (!ld(rp, lenOff) || !I32C(0) || !e.writeOp(Op::I32Ne) ||
+-              !e.writeOp(Op::I32And))
+-            return false;
+-          if (!GetLocal(e, wl) || !I32C(minRopeLen) || !e.writeOp(Op::I32GtU) ||
+-              !e.writeOp(Op::I32And))
+-            return false;
+-          if (!GetLocal(e, wl) || !I32C(maxLen) || !e.writeOp(Op::I32LeU) ||
+-              !e.writeOp(Op::I32And))
+-            return false;
+-          if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+-          // ap = *posAddr
+-          if (!I32C(posAddr) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+-              !e.writeVarU32(0) || !e.writeOp(Op::LocalSet) || !e.writeVarU32(ap))
+-            return false;
+-          // room? *(posAddr+endOff) >= ap + totalSize
+-          if (!I32C(posAddr) || !e.writeOp(Op::I32Load) || !e.writeVarU32(2) ||
+-              !e.writeVarU32(uint32_t(endOff)))
+-            return false;
+-          if (!GetLocal(e, ap) || !I32C(int32_t(totalSize)) ||
+-              !e.writeOp(Op::I32Add) || !e.writeOp(Op::I32GeU))
+-            return false;
+-          if (!e.writeOp(Op::If) || !e.writeFixedU8(0x40)) return false;
+-          // commit *posAddr = ap + totalSize
+-          if (!I32C(posAddr) || !GetLocal(e, ap) || !I32C(int32_t(totalSize)) ||
+-              !e.writeOp(Op::I32Add) || !st(0))
+-            return false;
+-          // header at ap
+-          if (!GetLocal(e, ap) || !I32C(strHdr) || !st(0)) return false;
+-          // ro = ap + hdrSize
+-          if (!GetLocal(e, ap) || !I32C(int32_t(hdrSize)) ||
+-              !e.writeOp(Op::I32Add) || !e.writeOp(Op::LocalSet) ||
+-              !e.writeVarU32(ro))
+-            return false;
+-          // [ro+flagsOff] = (bothLatin1 ? ropeFlagsL1 : ropeFlagsTB)
+-          if (!GetLocal(e, ro)) return false;
+-          if (!ld(lp, flagsOff) || !I32C(latin1Bit) || !e.writeOp(Op::I32And) ||
+-              !ld(rp, flagsOff) || !I32C(latin1Bit) || !e.writeOp(Op::I32And) ||
+-              !e.writeOp(Op::I32And))
+-            return false;
+-          if (!e.writeOp(Op::If) || !e.writeFixedU8(uint8_t(TypeCode::I32)) ||
+-              !I32C(ropeFlagsL1) || !e.writeOp(Op::Else) || !I32C(ropeFlagsTB) ||
+-              !e.writeOp(Op::End))
+-            return false;
+-          if (!st(flagsOff)) return false;
+-          // [ro+lenOff] = wl
+-          if (!GetLocal(e, ro) || !GetLocal(e, wl) || !st(lenOff)) return false;
+-          // [ro+leftOff] = lp ; [ro+rightOff] = rp
+-          if (!GetLocal(e, ro) || !GetLocal(e, lp) || !st(leftOff)) return false;
+-          if (!GetLocal(e, ro) || !GetLocal(e, rp) || !st(rightOff)) return false;
+-          // result = box(ro as String); br out of the i64 block (depth 3)
+-          if (!GetLocal(e, ro) || !EmitBoxFromStack(e, MIRType::String))
+-            return false;
+-          if (!e.writeOp(Op::Br) || !e.writeVarU32(3)) return false;
+-          if (!e.writeOp(Op::End)) return false;  // end room-if
+-          if (!e.writeOp(Op::End)) return false;  // end eligible-if
++          if (!emitRopeFromPtrs(3)) return false;
+           if (!e.writeOp(Op::End)) return false;  // end bothStrings-if
+         }
+         // helper fallback (leaves boxed i64 -> the i64 block result)
