@@ -816,3 +816,22 @@ warm=3) jit 2.9ms / pbl 44.1ms = 15.22x, checksum OK (was 26.5 / 39.4 =
 1.48x with short ropes only). string-ops stays checksum-OK at 2.37x.
 spa.js (iters=10 warm=2) jit 151.0 / pbl 320.4 = 2.12x, checksum OK, vs
 166.0ms with the opt-out.
+
+## 0018-wasmjit-fast-replace.patch
+
+`escapeHtml` is `String(s).replace(/[&<>"']/g, fn)`. A global replace
+that matches nothing still runs `RegExpReplace` →
+`RegExpGlobalReplaceOptFunc` → `Substring` (about 39k times per spa
+iteration). `String_replace`'s prologue now calls `WJH_FASTREPLACE`.
+For a global character class (no ignoreCase/unicode/sticky/hasIndices,
+latin1 members, no ranges, no negated class) the helper walks the rope
+and, on no match, zeros `lastIndex` and returns the input string. Any
+other regexp, or a hit, falls through to the existing body.
+`GECKO_WJ_NOFASTREPLACE=1` restores the old path.
+
+Measured (embed, iters=10 warm=2, work=2611977780, errors none): spa.js
+jit 115.5ms / pbl 307.5ms = 2.66x and jit 115.1 / pbl 293.6 = 2.55x.
+Same binary with `GECKO_WJ_NOFASTREPLACE=1`: jit 147.2 / pbl 304.7 =
+2.07x. concat-short (iters=30 warm=3) stays 15.96x, work=1600000.
+string-ops (iters=10 warm=2) 2.48x, work=635020377. octane regexp
+(iters=5 warm=1) stays 1.31x.
