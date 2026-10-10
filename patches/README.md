@@ -787,3 +787,17 @@ Measured (embed, iters=8 warm=2): string-ops jit 139.5ms / pbl 313.3ms =
 2.25x, checksum OK (was 279.3 / 283.0 = 1.01x). Same binary with
 `GECKO_WJ_NOROPECCA=1` is 376.5ms. spa.js (iters=10 warm=2) stays
 checksum-OK: jit 164.1 / pbl 325.6 = 1.98x, vs 174.7ms with the opt-out.
+
+## 0016-wasmjit-short-rope.patch
+
+Inline string `+` only built a rope when the result was longer than a fat
+inline Latin-1 string (24). Shorter pairs fell through to
+`WJH_BINARYARITH` / `ConcatStrings`, which copies into an inline string.
+spa's html builder and `concat-short` are mostly those short pairs.
+`JSRope::new_` has no minimum length, so the same nursery bump now ropes
+any two non-empty strings. `GECKO_WJ_NOSHORTROPE=1` restores the >24 gate.
+
+Measured (embed, iters=30 warm=3): concat-short jit 26.5ms / pbl 39.4ms =
+1.48x, checksum OK (opt-out 30.5 / 39.3 = 1.29x). spa.js (iters=10 warm=2)
+jit 130.4 / pbl 281.7 = 2.16x, checksum OK, vs 149.7ms with the opt-out.
+Helper histogram: `BINARITH` fell from ~38% of wjhelp calls to ~15%.

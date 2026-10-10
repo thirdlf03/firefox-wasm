@@ -1,0 +1,49 @@
+diff --git a/js/src/wasm/WasmJitBackend.cpp b/js/src/wasm/WasmJitBackend.cpp
+--- a/js/src/wasm/WasmJitBackend.cpp
++++ b/js/src/wasm/WasmJitBackend.cpp
+@@ -9566,12 +9566,15 @@
+         if (!e.writeOp(Op::Else)) return false;
+         // non-numbers. INLINE ROPE for string+string Add (splay's
+         // `'String for key '+tag+'...'` = 2.28M WJH_BINARYARITH->ConcatStrings hops,
+-        // each a C++ nursery string alloc). When both operands are strings, both
+-        // non-empty, and wholeLen > fat-inline latin1 max (24) -- so ConcatStrings
+-        // would ROPE not flatten, regardless of encoding -- bump-alloc a JSRope inline
+-        // (flags/length/left/right; nursery-fresh so NO post-barrier) instead of the
+-        // C++ helper. Everything else (non-strings / short / overflow / nursery-full)
+-        // falls to WJH_BINARYARITH (correct for all). GECKO_WJ_NOINLINECONCAT reverts.
++        // each a C++ nursery string alloc). When both operands are strings and
++        // both non-empty, bump-alloc a JSRope inline (flags/length/left/right;
++        // nursery-fresh so NO post-barrier) instead of the C++ helper. Short
++        // results (<= fat-inline latin1, 24) are ropes too: ConcatStrings would
++        // copy them into an inline string, and that hop dominates concat-short
++        // and spa's html `+`. A rope is a valid string at any positive length.
++        // Empty children, overflow, and a full nursery still fall to
++        // WJH_BINARYARITH. GECKO_WJ_NOINLINECONCAT disables every inline rope;
++        // GECKO_WJ_NOSHORTROPE restores the >24 gate.
+         static int inlineConcat = WJGETENV("GECKO_WJ_NOINLINECONCAT") ? 0 : 1;
+         if (!e.writeOp(Op::Block) || !e.writeFixedU8(uint8_t(TypeCode::I64)))
+           return false;
+@@ -9598,6 +9601,8 @@
+               int32_t(js::StringFlags::ropeFlags(js::CharEncoding::TwoByte));
+           int32_t latin1Bit = int32_t(js::StringFlags::LATIN1_CHARS_BIT);
+           int32_t fatMaxL1 = int32_t(JSFatInlineString::MAX_LENGTH_LATIN1);
++          static int noShortRope = WJGETENV("GECKO_WJ_NOSHORTROPE") ? 1 : 0;
++          int32_t minRopeLen = noShortRope ? fatMaxL1 : 0;
+           int32_t maxLen = int32_t(uint32_t(JSString::MAX_LENGTH));
+           int32_t strTag = int32_t(TagWord(JSVAL_TYPE_STRING));
+           int32_t strHdr = int32_t(uint32_t(gWJStringHeaderWord));
+@@ -9631,12 +9636,12 @@
+           if (!ld(lp, lenOff) || !ld(rp, lenOff) || !e.writeOp(Op::I32Add) ||
+               !e.writeOp(Op::LocalSet) || !e.writeVarU32(wl))
+             return false;
+-          // eligible = leftLen>0 & rightLen>0 & wl>fatMaxL1 & wl<=maxLen
++          // eligible = leftLen>0 & rightLen>0 & wl>minRopeLen & wl<=maxLen
+           if (!ld(lp, lenOff) || !I32C(0) || !e.writeOp(Op::I32Ne)) return false;
+           if (!ld(rp, lenOff) || !I32C(0) || !e.writeOp(Op::I32Ne) ||
+               !e.writeOp(Op::I32And))
+             return false;
+-          if (!GetLocal(e, wl) || !I32C(fatMaxL1) || !e.writeOp(Op::I32GtU) ||
++          if (!GetLocal(e, wl) || !I32C(minRopeLen) || !e.writeOp(Op::I32GtU) ||
+               !e.writeOp(Op::I32And))
+             return false;
+           if (!GetLocal(e, wl) || !I32C(maxLen) || !e.writeOp(Op::I32LeU) ||
