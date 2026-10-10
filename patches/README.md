@@ -801,3 +801,18 @@ Measured (embed, iters=30 warm=3): concat-short jit 26.5ms / pbl 39.4ms =
 1.48x, checksum OK (opt-out 30.5 / 39.3 = 1.29x). spa.js (iters=10 warm=2)
 jit 130.4 / pbl 281.7 = 2.16x, checksum OK, vs 149.7ms with the opt-out.
 Helper histogram: `BINARITH` fell from ~38% of wjhelp calls to ~15%.
+
+## 0017-wasmjit-int-string-rope.patch
+
+`string + int` and `int + string` still went through `WJH_BINARYARITH`
+(`AddValues` -> `ToString` -> `ConcatStrings`). Decimal atoms for
+0..255 are permanent (`StaticStrings::intStaticTable`). When one Add
+operand is a string and the other is an int32 in that range, the JIT
+loads the atom and builds the same nursery rope as string+string.
+`GECKO_WJ_NOINTSTR=1` skips it. `intStaticTableBase()` exposes the table.
+
+Measured (embed): concat-short (`"ab"+(i&7)+"cdef"+(i&3)`, iters=30
+warm=3) jit 2.9ms / pbl 44.1ms = 15.22x, checksum OK (was 26.5 / 39.4 =
+1.48x with short ropes only). string-ops stays checksum-OK at 2.37x.
+spa.js (iters=10 warm=2) jit 151.0 / pbl 320.4 = 2.12x, checksum OK, vs
+166.0ms with the opt-out.
