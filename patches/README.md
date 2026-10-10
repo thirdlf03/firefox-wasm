@@ -772,3 +772,18 @@ getter/setter calls still use `PBL_CALL_INTERP` -- their return-continuation
 operand counts differ from the Call convention (bound-arg expansion,
 GetProp vs argc+2) and need the caller-operand rewrite before they can
 share this path.
+
+## 0015-wasmjit-rope-charcodeat.patch
+
+Inline `charCodeAt` deopted the whole function when the string was a rope
+(`LINEAR_BIT` clear). `string-ops` builds `base + i` (a rope) and then
+walks it with `charCodeAt`, so the compiled function never stayed in JIT
+(1.01x vs PBL). The rope arm now calls `WJH_CHARCODEAT`, which flattens
+and returns the code, and the rest of the function stays compiled. The
+next index sees `LINEAR_BIT` and takes the inline load.
+`GECKO_WJ_NOROPECCA=1` restores the deopt.
+
+Measured (embed, iters=8 warm=2): string-ops jit 139.5ms / pbl 313.3ms =
+2.25x, checksum OK (was 279.3 / 283.0 = 1.01x). Same binary with
+`GECKO_WJ_NOROPECCA=1` is 376.5ms. spa.js (iters=10 warm=2) stays
+checksum-OK: jit 164.1 / pbl 325.6 = 1.98x, vs 174.7ms with the opt-out.

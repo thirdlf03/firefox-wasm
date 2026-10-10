@@ -1,0 +1,51 @@
+diff --git a/js/src/wasm/WasmJitBackend.cpp b/js/src/wasm/WasmJitBackend.cpp
+--- a/js/src/wasm/WasmJitBackend.cpp
++++ b/js/src/wasm/WasmJitBackend.cpp
+@@ -3958,19 +3958,33 @@
+     return GetOp(e, be, strD) && e.writeOp(Op::I32Load) && e.writeVarU32(2) &&
+            e.writeVarU32(flagsOff);
+   };
+-  // Rope guard: a JSRope stores `left` (a JSString*) where a linear string
+-  // stores nonInlineChars, so reading rope chars inline yields garbage. Ropes
+-  // need C++ flattening -> deopt to PBL (rare; ropes are cold here).
++  // Rope: `left` sits where a linear string stores nonInlineChars, so an inline
++  // load would read a pointer as characters. Deopting the whole function here
++  // sends every rope-heavy loop (string-ops `base+i`, then charCodeAt) to PBL
++  // for the rest of the call. WJH_CHARCODEAT flattens and returns the code;
++  // the rest of the function stays in JIT, and the next index sees LINEAR_BIT.
++  // GECKO_WJ_NOROPECCA restores the whole-function deopt.
++  static int noRopeCca = WJGETENV("GECKO_WJ_NOROPECCA") ? 1 : 0;
++  if (!e.writeOp(Op::Block) || !e.writeFixedU8(0x7F)) return false;  // i32
+   if (!loadFlags() || !e.writeOp(Op::I32Const) || !e.writeVarS32(LIN) ||
+       !e.writeOp(Op::I32And) || !e.writeOp(Op::I32Eqz) || !e.writeOp(Op::If) ||
+       !e.writeFixedU8(0x40))
+     return false;
+-  {
++  if (noRopeCca) {
+     bool saved = be.inDispatchBody;
+     be.inDispatchBody = false;
+     bool ok = EmitDeopt(e, be);
+     be.inDispatchBody = saved;
+     if (!ok) return false;
++  } else {
++    if (!EmitStageScratch(e, be, strD, 0) || !EmitStageScratch(e, be, idxD, 1))
++      return false;
++    // site 1: MCharCodeAtOrNegative returns -1 on OOB instead of throwing.
++    if (!EmitHelperCallResult(e, be, ins, WJH_CHARCODEAT, negOnOob ? 1.0 : 0.0))
++      return false;
++    if (!EmitHelperResultAsType(e, be, MIRType::Int32)) return false;
++    // br 0 = this if, br 1 = the i32 block.
++    if (!e.writeOp(Op::Br) || !e.writeVarU32(1)) return false;
+   }
+   if (!e.writeOp(Op::End)) return false;
+   // (uint)idx >= length ?  (OOB)
+@@ -4017,7 +4031,8 @@
+       !e.writeVarU32(0))
+     return false;
+   if (!e.writeOp(Op::End)) return false;  // end latin1/twobyte
+-  return e.writeOp(Op::End);              // end OOB else
++  if (!e.writeOp(Op::End)) return false;  // end OOB else
++  return e.writeOp(Op::End);              // end rope/linear block
+ }
+ 
+ // LoadSlotByIteratorIndex[Indexed]: inline the CacheIR/Ion pointer arithmetic that
