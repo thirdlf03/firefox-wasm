@@ -835,3 +835,25 @@ Same binary with `GECKO_WJ_NOFASTREPLACE=1`: jit 147.2 / pbl 304.7 =
 2.07x. concat-short (iters=30 warm=3) stays 15.96x, work=1600000.
 string-ops (iters=10 warm=2) 2.48x, work=635020377. octane regexp
 (iters=5 warm=1) stays 1.31x.
+
+## 0019-wasmjit-sink-unbox-guard.patch
+
+A fallible `Unbox` emits its tag guard where the MIR node sits, even when
+every use is in a later block. LICM hoisted `Unbox(mapfn -> Object)` out of
+`ArrayFrom`'s for-of loop into the preheader: the only consumer is the
+`callContentFunction(mapfn, ...)` arm, so `Array.from(set)` with no mapfn
+hit the Object tag guard on `undefined` and deopted the function to PBL
+once per call (~3k/iter on spa, ~99% of all resumes).
+
+When no use is in the Unbox's own block and every real use is a
+non-phi definition in a strictly-dominated block with an entry resume
+point, the backend now emits the unguarded conversion at the def and the
+tag guard at the head of each consuming block (under that block's entry
+resume point). The guard still runs before any use executes; paths that
+never consume the value skip it. `GECKO_WJ_NOSUNKUNBOX=1` restores the
+def-site guard. `[wj-ub]` prints the resume-pc offset for site matching.
+
+Measured (embed, iters=10 warm=2, work=2611977780, errors none): spa.js
+jit 61.5ms / pbl 193.5ms = 3.15x (was jit 65.4 / pbl 188.2 = 2.88x on the
+same binary before this patch; the ArrayFrom Unbox deopt count went from
+13112 in 5 runs to 0). micro suite 23/23 checksums OK.
