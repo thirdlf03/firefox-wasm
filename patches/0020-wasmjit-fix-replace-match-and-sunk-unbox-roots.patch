@@ -1,0 +1,217 @@
+diff --git a/js/src/wasm/WasmJitBackend.cpp b/js/src/wasm/WasmJitBackend.cpp
+--- a/js/src/wasm/WasmJitBackend.cpp
++++ b/js/src/wasm/WasmJitBackend.cpp
+@@ -67,6 +67,7 @@
+ #include "vm/StringFlags.h"      // StringFlags::ropeFlags / CharEncoding (inline rope concat)
+ #include "vm/EnvironmentObject.h"  // BlockLexicalEnvironmentObject (NewLexicalEnvironmentObject)
+ #include "vm/Scope.h"            // LexicalScope (NewLexicalEnvironmentObject)
++#include "vm/SelfHosting.h"      // GetClonedSelfHostedFunctionName (String_replace)
+ #include "jit/InlinableNatives.h"  // InlinableNative (UnsafeGet/SetReservedSlot inlining)
+ #include "wasm/WasmBinary.h"
+ 
+@@ -314,6 +315,9 @@
+   std::unordered_map<const MBasicBlock*,
+                      std::vector<std::pair<uint32_t, uint32_t>>>
+       sunkGuards;
++  // Sunk-unbox result local -> (inputLocal, tag). Until the sunk guard runs the
++  // local may hold a non-pointer payload, so GC spills check the input tag.
++  std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> sunkUnboxLocals;
+   std::unordered_map<uint32_t, uintptr_t> nurseryObjSlot;  // NurseryObject node id -> traced const-pool slot (rematerialize, never cache: a minor GC moves the object, the slot is traced/current, a cached local goes stale -- the deltablue-under-inlining corruption)
+   uint32_t curOp = 0;                 // op() of the instruction being emitted (deopt histogram)
+   uint32_t deoptCallLine = 0;         // __LINE__ of the EmitDeopt call (deopt-line histogram)
+@@ -2181,6 +2185,28 @@
+   if constexpr (kWJEHABI) return EmitThrowWjexn(e);
+   return e.writeOp(Op::F64Const) && e.writeFixedF64(1.0) &&
+          e.writeOp(Op::I64Const) && e.writeVarS64(0) && e.writeOp(Op::Return);
++}
++
++// Push the boxed Value spilled to gWJCallRoots for a root local (kind as in
++// WJCollectRoots). A sunk Unbox local is boxed only while its input still has
++// the unboxed tag; otherwise it spills undefined so the GC never traces the
++// payload of e.g. `undefined` as a JSObject*.
++static bool EmitBoxRootLocal(Encoder& e, WJBackend& be, uint32_t local,
++                             uint8_t kind) {
++  static const MIRType kKindType[] = {MIRType::Value, MIRType::Object,
++                                      MIRType::String, MIRType::Symbol,
++                                      MIRType::BigInt};
++  if (!GetLocal(e, local)) return false;
++  if (kind && !EmitBoxFromStack(e, kKindType[kind])) return false;
++  auto s = be.sunkUnboxLocals.find(local);
++  if (s == be.sunkUnboxLocals.end()) return true;
++  return e.writeOp(Op::I64Const) &&
++         e.writeVarS64(int64_t(JS::UndefinedValue().asRawBits())) &&
++         GetLocal(e, s->second.first) && e.writeOp(Op::I64Const) &&
++         e.writeVarS64(32) && e.writeOp(Op::I64ShrU) &&
++         e.writeOp(Op::I32WrapI64) && e.writeOp(Op::I32Const) &&
++         e.writeVarS32(int32_t(s->second.second)) && e.writeOp(Op::I32Eq) &&
++         e.writeOp(Op::SelectNumeric);
+ }
+ 
+ static bool EmitHelperCallResult(Encoder& e, WJBackend& be, MInstruction* ins,
+@@ -2242,11 +2268,7 @@
+   auto emitSlotBase = [&]() -> bool { return GetLocal(e, be.rootBaseLocal); };
+   for (uint32_t k = 0; k < nRoots; k++) {
+     if (!emitSlotBase()) return false;
+-    if (!GetLocal(e, rootLocal[k])) return false;
+-    if (rootIsObj[k] == 1 && !EmitBoxFromStack(e, MIRType::Object)) return false;
+-    if (rootIsObj[k] == 2 && !EmitBoxFromStack(e, MIRType::String)) return false;
+-    if (rootIsObj[k] == 3 && !EmitBoxFromStack(e, MIRType::Symbol)) return false;
+-    if (rootIsObj[k] == 4 && !EmitBoxFromStack(e, MIRType::BigInt)) return false;
++    if (!EmitBoxRootLocal(e, be, rootLocal[k], rootIsObj[k])) return false;
+     if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(k * 8))
+       return false;
+   }
+@@ -5427,6 +5449,8 @@
+                                              : TagWord(JSVAL_TYPE_BIGINT);
+             for (MBasicBlock* ub : useBlks)
+               be.sunkGuards[ub].push_back({uint32_t(inLocal), tag});
++            if (int32_t ul = be.local(u); ul >= 0)
++              be.sunkUnboxLocals[uint32_t(ul)] = {uint32_t(inLocal), tag};
+             fallible = false;
+           }
+         }
+@@ -12050,11 +12074,9 @@
+                 !e.writeVarU32(be.rootBaseLocal))
+               return false;
+             for (uint32_t k = 0; k < cn; k++) {
+-              if (!GetLocal(e, be.rootBaseLocal) || !GetLocal(e, croot[k])) return false;
+-              if (crootObj[k] == 1 && !EmitBoxFromStack(e, MIRType::Object)) return false;
+-              if (crootObj[k] == 2 && !EmitBoxFromStack(e, MIRType::String)) return false;
+-              if (crootObj[k] == 3 && !EmitBoxFromStack(e, MIRType::Symbol)) return false;
+-              if (crootObj[k] == 4 && !EmitBoxFromStack(e, MIRType::BigInt)) return false;
++              if (!GetLocal(e, be.rootBaseLocal) ||
++                  !EmitBoxRootLocal(e, be, croot[k], crootObj[k]))
++                return false;
+               if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(k * 8))
+                 return false;
+             }
+@@ -12310,11 +12332,7 @@
+       auto emitSlotBase = [&]() -> bool { return GetLocal(e, be.rootBaseLocal); };
+       for (uint32_t k = 0; k < nRoots; k++) {
+         if (!emitSlotBase()) return false;
+-        if (!GetLocal(e, rootLocal[k])) return false;
+-        if (rootIsObj[k] == 1 && !EmitBoxFromStack(e, MIRType::Object)) return false;
+-    if (rootIsObj[k] == 2 && !EmitBoxFromStack(e, MIRType::String)) return false;
+-    if (rootIsObj[k] == 3 && !EmitBoxFromStack(e, MIRType::Symbol)) return false;
+-    if (rootIsObj[k] == 4 && !EmitBoxFromStack(e, MIRType::BigInt)) return false;
++        if (!EmitBoxRootLocal(e, be, rootLocal[k], rootIsObj[k])) return false;
+         if (!e.writeOp(Op::I64Store) || !e.writeVarU32(3) || !e.writeVarU32(k * 8))
+           return false;
+       }
+@@ -16095,21 +16113,20 @@
+   return e.writeOp(Op::End);
+ }
+ 
++// Match by name, not line: selfhosted.js line numbers differ between the
++// shell and the full-browser build (4307 is Substring in the latter). The
++// String.prototype.replace clone keeps "String_replace" in its lazy-name slot
++// and displays as "replace".
+ static bool WJIsStringReplace(JSScript* sc) {
+-  if (!sc || !sc->filename() || !strstr(sc->filename(), "self-hosted")) return false;
+-  // Pinned self-hosted line of String_replace (obj selfhosted.js). The atom
+-  // check covers a regenerated line number.
+-  if (sc->lineno() == 4307) return true;
++  if (!sc || !sc->selfHosted()) return false;
+   JSFunction* f = sc->function();
+   if (!f) return false;
++  if (JSAtom* sh = js::GetClonedSelfHostedFunctionName(f))
++    return js::StringEqualsLiteral(sh, "String_replace");
+   JSAtom* a = f->maybePartialDisplayAtom();
+-  if (!a || !a->hasLatin1Chars() || a->length() != 13) return false;
+-  JS::AutoCheckCannotGC nogc;
+-  const JS::Latin1Char* c = a->latin1Chars(nogc);
+-  const char* name = "String_replace";
+-  for (size_t i = 0; i < 13; i++)
+-    if (c[i] != uint8_t(name[i])) return false;
+-  return true;
++  if (!a) return false;
++  return js::StringEqualsLiteral(a, "String_replace") ||
++         (js::StringEqualsLiteral(a, "replace") && f->nargs() == 2);
+ }
+ 
+ bool js::wasm::WJEmitBody(MIRGenerator& mir, MIRGraph& graph, uint32_t nargs,
+@@ -16782,6 +16799,19 @@
+   // escapeHtml's /[&<>"']/g is this shape and otherwise walks
+   // replace -> RegExpReplace -> RegExpGlobalReplaceOptFunc -> Substring.
+   if (WJIsStringReplace(mir.outerInfo().script())) {
++    // Only a string receiver with an object search value can hit; skip the
++    // helper hop for string searches and everything else.
++    auto tagIs = [&](uint32_t param, uint32_t tag) -> bool {
++      return e.writeOp(Op::LocalGet) && e.writeVarU32(param) &&
++             e.writeOp(Op::I64Const) && e.writeVarS64(32) &&
++             e.writeOp(Op::I64ShrU) && e.writeOp(Op::I32WrapI64) &&
++             e.writeOp(Op::I32Const) && e.writeVarS32(int32_t(tag)) &&
++             e.writeOp(Op::I32Eq);
++    };
++    if (!tagIs(kWJThisParam, TagWord(JSVAL_TYPE_STRING)) ||
++        !tagIs(kWJArg0Param, TagWord(JSVAL_TYPE_OBJECT)) ||
++        !e.writeOp(Op::I32And) || !e.writeOp(Op::If) || !e.writeFixedU8(0x40))
++      return false;
+     auto stage = [&](uint32_t param, uint32_t off) -> bool {
+       if (!e.writeOp(Op::LocalGet) || !e.writeVarU32(0) ||
+           !e.writeOp(MiscOp::I32TruncSatF64S))
+@@ -16807,6 +16837,7 @@
+       return false;
+     if (!e.writeOp(Op::Return)) return false;
+     if (!e.writeOp(Op::End)) return false;
++    if (!e.writeOp(Op::End)) return false;  // end tag gate
+   }
+   // Persistently GC-root the env for closures: push boxed(envLocal) onto the
+   // GC-root shadow stack at the current gWJRootSP, remember the slot index in
+diff --git a/js/src/wasm/WasmJitRuntime.cpp b/js/src/wasm/WasmJitRuntime.cpp
+--- a/js/src/wasm/WasmJitRuntime.cpp
++++ b/js/src/wasm/WasmJitRuntime.cpp
+@@ -3030,16 +3030,21 @@
+     if (ch == '\\') {
+       if (i + 2 >= n) return 3.0;
+       char16_t e = buf[i + 1];
++      bool alnum = (e >= '0' && e <= '9') || (e >= 'a' && e <= 'z') ||
++                   (e >= 'A' && e <= 'Z');
+       if (e == 'n') ch = '\n';
+       else if (e == 't') ch = '\t';
+       else if (e == 'r') ch = '\r';
+-      else if (e == '\\' || e == ']' || e == '[' || e == '-' || e == '^' ||
+-               e == '.')
+-        ch = e;
++      else if (e == 'f') ch = '\f';
++      else if (e == 'v') ch = '\v';
++      else if (e < 128 && !alnum && e != '_')
++        ch = e;  // identity escape: \/ \" \' \] \- ...
+       else
+         return 3.0;
+       i += 2;
+-    } else if (ch == '-') {
++    } else if (ch == '-' || ch == ']' || ch == '[') {
++      // An inner unescaped `]` closes the class early (`[a]|[^b]`), so the
++      // source is not one class.
+       return 3.0;
+     } else {
+       i += 1;
+@@ -3049,16 +3054,19 @@
+     any = true;
+   }
+   if (!any) return 3.0;
+-  std::vector<JSString*> pending;
+-  pending.push_back(thisv.toString());
+-  while (!pending.empty()) {
+-    if (pending.size() > 2048) return 3.0;
+-    JSString* cur = pending.back();
+-    pending.pop_back();
++  // The right child is visited first, so a left-leaning `s += x` rope keeps
++  // this stack shallow. A deeper rope falls back to the full replace.
++  constexpr size_t kMaxPending = 512;
++  JSString* pending[kMaxPending];
++  size_t np = 0;
++  pending[np++] = thisv.toString();
++  while (np) {
++    JSString* cur = pending[--np];
+     if (!cur->isLinear()) {
++      if (np + 2 > kMaxPending) return 3.0;
+       JSRope& rope = cur->asRope();
+-      pending.push_back(rope.leftChild());
+-      pending.push_back(rope.rightChild());
++      pending[np++] = rope.leftChild();
++      pending[np++] = rope.rightChild();
+       continue;
+     }
+     JSLinearString* lin = &cur->asLinear();
