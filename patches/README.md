@@ -893,6 +893,37 @@ Fixes for 0018 and 0019.
 the old binary in these runs. The micro suite stays 24/24 checksum OK.
 spa.js (iters=10 warm=2) gave 3.14x, 3.02x and 3.12x, work=2611977780.
 
+## 0021-wasmjit-gc-current-actuals-and-nursery-string-flag.patch
+
+YouTube watch pages never registered `ytd-app` with the JIT on (title,
+channel and comments stayed skeletons; `GECKO_NOWASMJIT=1` worked). The
+pre-0015 build failed the same way. `GECKO_WJ_COMPILEMAX` bisection in
+the browser pointed at kevlar_main_module line 3470, the decorator
+helpers of the form
+`function(){var Y=_.T7.apply(0,arguments);return function(m,U,V){...}}`.
+
+`micro apply-args-decorator` reproduces it in the shell (JIT/PBL
+mismatch on every run). The callee has no formals, so its actuals exist
+only as raw wasm params. `NewCallObject` runs before
+`CreateArgumentsObject`, and when it triggers a minor GC the nursery
+string argument moves but the raw param does not. The arguments object
+then captured the stale pointer: about 33 of 360k reads saw
+`a.length == 0`.
+
+* `CreateArgumentsObject` and `Rest` now stage actuals with
+  `EmitActualArg`. With `needsArgRoots` (already set for both) that reads
+  the prologue's traced `gWJCallRoots` slot, as the resume graft did.
+* The inline rope alloc also re-checks `zone->allocNurseryStrings()` at
+  run time (`Zone::addressOfAllocNurseryStrings`). Pretenuring can turn
+  nursery strings off later. Ion code is discarded then, but wasm-JIT code
+  is not, and stubs rebuilt afterwards drop string post-barriers.
+
+Measured (embed): `micro apply-args-decorator` 10/10 checksum OK (was
+0/10). micro (iters=30 warm=3) 25/25 OK, geomean 6.41x. spa 3.38x / 3.35x
+/ 3.06x, work=2611977780. octane deltablue/regexp/richards in four
+interleaved rounds against the 0020 binary: within noise on a loaded
+host.
+
 ## Status / handoff (2026-10-10)
 
 - spa goal (>= 2.882x over >=10 iters): **met** by 0019 (see above).
