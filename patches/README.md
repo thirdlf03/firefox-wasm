@@ -862,6 +862,37 @@ Repeated `node bench/main.ts spa --ab --iters 10 --warm 2` runs after this
 patch (16 samples): per-run ratios 2.89-3.23, median ~3.09 -- every run
 above the 2.882x goal.
 
+## 0020-wasmjit-fix-replace-match-and-sunk-unbox-roots.patch
+
+Fixes for 0018 and 0019.
+
+* `WJIsStringReplace` matched self-hosted line 4307. That is `String_replace`
+  in the shell build but `Substring` in the full-browser build
+  (`obj-full-emscripten/js/src/selfhosted.js`), so the browser got no fast
+  replace and paid a helper hop on every `Substring`. The name fallback
+  compared 13 chars of a 14-char name and never matched. It now checks the
+  lazy self-hosted name slot (`String_replace`) or the display name
+  `replace` with 2 formals.
+* The fast-replace class parser read `[a]|[^b]` as one class and returned
+  the input for strings with none of `a ] | [ ^ b`, where the real regexp
+  replaces every char. An inner unescaped `[` or `]` now falls back. Identity
+  escapes of any non-alphanumeric ASCII char (`\/`, `\"`) and `\f` `\v` are
+  accepted.
+* The prologue calls `WJH_FASTREPLACE` only for a string receiver and an
+  object search value, and the rope walk uses a fixed 512-entry stack
+  instead of a heap `std::vector`.
+* A sunk Unbox leaves the payload of a non-matching Value (for example 0
+  for `undefined`) in its local until the sunk guard runs, and the GC-root
+  spill boxed that local as an Object/String/Symbol/BigInt. Spills of a sunk
+  Unbox local now select undefined unless the input still has the unboxed
+  tag.
+
+`micro replace-unbox` covers both. Before this patch it mismatched
+(jit=952159351 pbl=1090354983). After it matches (1090354983), also with
+`--gczeal 2,100` and `--nursery-mb 1`. The GC-root case did not crash on
+the old binary in these runs. The micro suite stays 24/24 checksum OK.
+spa.js (iters=10 warm=2) gave 3.14x, 3.02x and 3.12x, work=2611977780.
+
 ## Status / handoff (2026-10-10)
 
 - spa goal (>= 2.882x over >=10 iters): **met** by 0019 (see above).
