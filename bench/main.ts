@@ -257,6 +257,27 @@ function microRun(files: string[], f: ReturnType<typeof parseFlags>, pbl: boolea
   };
 }
 
+// Run one micro-driver bench (A/B or single) and print its line. Returns the
+// ratio when it counts toward the geomean, null when it is excluded, and
+// undefined for a single (non-A/B) run.
+function microLine(name: string, files: string[], f: ReturnType<typeof parseFlags>): number | null | undefined {
+  if (!f.ab) {
+    const x = microRun(files, f, f.pbl);
+    console.log(pad(name) + (x.per != null ? `${x.per}ms` : 'ERR')
+      + `  work=${x.sum ?? '-'}  errors=${x.err ?? '-'}`
+      + (f.bails ? `   bails: ${bailSurvey(x.raw.err)}` : ''));
+    return undefined;
+  }
+  const j = microRun(files, f, false), p = microRun(files, f, true);
+  const ratio = j.per && p.per ? (+p.per / +j.per) : null;
+  const matched = j.sum != null && p.sum != null && j.sum === p.sum && !j.err && !p.err;
+  const diff = j.sum != null && p.sum != null ? (j.sum === p.sum ? 'OK' : `*** MISMATCH jit=${j.sum} pbl=${p.sum}`) : '?';
+  console.log(pad(name) + `jit=${j.per ?? 'ERR'}ms  pbl=${p.per ?? 'ERR'}ms  => ${ratio != null ? ratio.toFixed(2) + 'x' : 'n/a'}  ${diff}`
+    + `  work jit=${j.sum ?? '-'} pbl=${p.sum ?? '-'}  errors jit=${j.err ?? '-'} pbl=${p.err ?? '-'}`
+    + (f.bails ? `   bails: ${bailSurvey(j.raw.err)}` : ''));
+  return matched && ratio != null ? ratio : null;
+}
+
 function runMicro(names: string[], f: ReturnType<typeof parseFlags>) {
   const all = fs.readdirSync(MICRO).filter((x) => x.endsWith('.js') && x !== 'micro-driver.js').map((x) => x.slice(0, -3)).sort();
   const list = names.length ? names : all;
@@ -269,23 +290,9 @@ function runMicro(names: string[], f: ReturnType<typeof parseFlags>) {
   for (const name of list) {
     const bench = path.join(MICRO, `${name}.js`);
     if (!fs.existsSync(bench)) { console.log(pad(name) + 'UNKNOWN'); continue; }
-    const files = [prelude, bench, driver];
-    if (f.ab) {
-      const j = microRun(files, f, false), p = microRun(files, f, true);
-      const ratio = j.per && p.per ? (+p.per / +j.per) : null;
-      const matched = j.sum != null && p.sum != null && j.sum === p.sum && !j.err && !p.err;
-      const diff = j.sum != null && p.sum != null ? (j.sum === p.sum ? 'OK' : `*** MISMATCH jit=${j.sum} pbl=${p.sum}`) : '?';
-      if (matched && ratio != null) ratios.push(ratio);
-      else excluded++;
-      console.log(pad(name) + `jit=${j.per ?? 'ERR'}ms  pbl=${p.per ?? 'ERR'}ms  => ${ratio != null ? ratio.toFixed(2) + 'x' : 'n/a'}  ${diff}`
-        + `  work jit=${j.sum ?? '-'} pbl=${p.sum ?? '-'}  errors jit=${j.err ?? '-'} pbl=${p.err ?? '-'}`
-        + (f.bails ? `   bails: ${bailSurvey(j.raw.err)}` : ''));
-    } else {
-      const x = microRun(files, f, f.pbl);
-      console.log(pad(name) + (x.per != null ? `${x.per}ms` : 'ERR')
-        + `  work=${x.sum ?? '-'}  errors=${x.err ?? '-'}`
-        + (f.bails ? `   bails: ${bailSurvey(x.raw.err)}` : ''));
-    }
+    const r = microLine(name, [prelude, bench, driver], f);
+    if (r != null) ratios.push(r);
+    else if (r === null) excluded++;
   }
   if (f.ab) printGeo('micro', ratios, excluded);
 }
@@ -299,26 +306,8 @@ function runSpa(f: ReturnType<typeof parseFlags>) {
   if (!fs.existsSync(bench)) { console.log(pad('spa') + 'MISSING bench/spa/spa.js'); return; }
   console.log(`# spa (bench/spa/spa.js; perIter ms, lower=better; iters=${f.iters} warm=${f.warm})`
     + (f.ab ? '  [pbl/jit ratio]' : f.pbl ? '  [PBL]' : '  [JIT]'));
-  const files = [prelude, bench, driver];
-  const ratios: number[] = [];
-  let excluded = 0;
-  if (f.ab) {
-    const j = microRun(files, f, false), p = microRun(files, f, true);
-    const ratio = j.per && p.per ? (+p.per / +j.per) : null;
-    const matched = j.sum != null && p.sum != null && j.sum === p.sum && !j.err && !p.err;
-    const diff = j.sum != null && p.sum != null ? (j.sum === p.sum ? 'OK' : `*** MISMATCH jit=${j.sum} pbl=${p.sum}`) : '?';
-    if (matched && ratio != null) ratios.push(ratio);
-    else excluded++;
-    console.log(pad('spa') + `jit=${j.per ?? 'ERR'}ms  pbl=${p.per ?? 'ERR'}ms  => ${ratio != null ? ratio.toFixed(2) + 'x' : 'n/a'}  ${diff}`
-      + `  work jit=${j.sum ?? '-'} pbl=${p.sum ?? '-'}  errors jit=${j.err ?? '-'} pbl=${p.err ?? '-'}`
-      + (f.bails ? `   bails: ${bailSurvey(j.raw.err)}` : ''));
-  } else {
-    const x = microRun(files, f, f.pbl);
-    console.log(pad('spa') + (x.per != null ? `${x.per}ms` : 'ERR')
-      + `  work=${x.sum ?? '-'}  errors=${x.err ?? '-'}`
-      + (f.bails ? `   bails: ${bailSurvey(x.raw.err)}` : ''));
-  }
-  if (f.ab) printGeo('spa', ratios, excluded);
+  const r = microLine('spa', [prelude, bench, driver], f);
+  if (f.ab) printGeo('spa', r != null ? [r] : [], r === null ? 1 : 0);
 }
 
 function runUbo(f: ReturnType<typeof parseFlags>) {
